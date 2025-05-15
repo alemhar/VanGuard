@@ -54,6 +54,7 @@ Improve detection accuracy and add more sophisticated behavioral analysis.
   - Box opening/product removal detection
   - Pattern recognition for concealment behaviors
   - Staff identification
+  - Optical flow stabilization for vibration compensation
 - **Transaction Correlation**:
   - Match inventory access events with POS transactions
   - Flag discrepancies between inventory movement and sales
