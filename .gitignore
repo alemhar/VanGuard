@@ -36,3 +36,11 @@ coverage.xml
 output/
 *.log
 config.json
+
+# Testing data and results
+testing/test_data/
+testing/test_results/
+testing/output/
+*_results.json
+*_report.md
+smartvan_test_results.log
