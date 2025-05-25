@@ -319,13 +319,14 @@ class YOLODetector:
             "yolo_skipped": False
         }
     
-    def visualize(self, frame: np.ndarray, detection_result: Dict[str, Any]) -> np.ndarray:
+    def visualize(self, frame: np.ndarray, detection_result: Dict[str, Any], show_text: bool = True) -> np.ndarray:
         """
         Visualize detection results on the frame.
         
         Args:
             frame: Current video frame
             detection_result: Result from detect method
+            show_text: Whether to show text overlays (set to False when used in integrated detector)
             
         Returns:
             Frame with detection visualizations
@@ -341,6 +342,9 @@ class YOLODetector:
         boxes = detection_result.get("boxes", [])
         classes = detection_result.get("classes", [])
         confidences = detection_result.get("confidences", [])
+        
+        # Set line thickness based on show_text
+        line_thickness = 1 if not show_text else 2
         
         for i in range(len(boxes)):
             # Get box coordinates
@@ -358,16 +362,18 @@ class YOLODetector:
                 color = (255, 0, 0)  # Blue for other objects
             
             # Draw bounding box
-            cv2.rectangle(vis_frame, (x, y), (x + w, y + h), color, 2)
+            cv2.rectangle(vis_frame, (x, y), (x + w, y + h), color, line_thickness)
             
-            # Draw label
-            label = f"{class_name} {confidence:.2f}"
-            cv2.putText(vis_frame, label, (x, y - 10), 
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            # Draw label only if show_text is True
+            if show_text:
+                label = f"{class_name} {confidence:.2f}"
+                cv2.putText(vis_frame, label, (x, y - 10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # Add inference time
-        inference_time = detection_result.get("inference_time", 0)
-        cv2.putText(vis_frame, f"YOLO Inference: {inference_time:.3f}s", 
-                  (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # Add inference time only if show_text is True
+        if show_text:
+            inference_time = detection_result.get("inference_time", 0)
+            cv2.putText(vis_frame, f"YOLO Inference: {inference_time:.3f}s", 
+                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
         return vis_frame

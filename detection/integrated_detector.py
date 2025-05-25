@@ -273,38 +273,43 @@ class IntegratedDetector:
         Returns:
             Frame with detection visualizations
         """
-        # Start with motion visualization
-        motion_result = detection_result.get("motion_result", {})
-        vis_frame = self.motion_detector.visualize(frame, motion_result)
+        # Start with a copy of the original frame
+        vis_frame = frame.copy()
         
-        # Add YOLO visualization if YOLO was run
+        # Get detection data
+        motion_result = detection_result.get("motion_result", {})
         yolo_result = detection_result.get("yolo_result", {})
         yolo_skipped = yolo_result.get("yolo_skipped", True)
         
+        # Draw motion visualization without text overlays
+        vis_frame = self.motion_detector.visualize(vis_frame, motion_result, show_text=False)
+        
+        # Draw YOLO visualization without text overlays
         if not yolo_skipped:
-            vis_frame = self.yolo_detector.visualize(vis_frame, yolo_result)
+            vis_frame = self.yolo_detector.visualize(vis_frame, yolo_result, show_text=False)
         
         # Get frame dimensions for better text positioning
         height, width = vis_frame.shape[:2]
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6
-        font_thickness = 2
-        line_height = 30  # Space between text lines
+        font_scale = 0.45  # Smaller font size
+        font_thickness = 1  # Thinner text
+        line_height = 20  # Smaller spacing between lines
         
         # Draw semi-transparent background for status text area
-        status_bg_height = 150
+        status_bg_height = 120  # Smaller background height
         status_overlay = vis_frame.copy()
         cv2.rectangle(status_overlay, (0, 0), (width, status_bg_height), (0, 0, 0), -1)
-        cv2.addWeighted(status_overlay, 0.3, vis_frame, 0.7, 0, vis_frame)
+        cv2.addWeighted(status_overlay, 0.4, vis_frame, 0.6, 0, vis_frame)  # More opaque background
         
-        # Starting position for text
-        text_y = 30
+        # Starting position for text (further from top edge)
+        text_y = 18
+        left_margin = 5
         
         # Add motion information
         motion_detected = detection_result.get("motion_detected", False)
         intensity = detection_result.get("intensity", 0)
-        motion_text = f"Motion: {'YES' if motion_detected else 'NO'} | Intensity: {intensity:.1f}"
-        cv2.putText(vis_frame, motion_text, (10, text_y), 
+        motion_text = f"Motion: {'YES' if motion_detected else 'NO'} | Int: {intensity:.1f}"
+        cv2.putText(vis_frame, motion_text, (left_margin, text_y), 
                   font, font_scale, (255, 255, 255), font_thickness)
         text_y += line_height
         
@@ -314,25 +319,25 @@ class IntegratedDetector:
         
         # Color based on confidence (red if high confidence)
         human_color = (0, 0, 255) if human_detected and human_confidence > 0.7 else (0, 255, 0)
-        human_text = f"Human: {'YES' if human_detected else 'NO'} | Confidence: {human_confidence:.2f}"
-        cv2.putText(vis_frame, human_text, (10, text_y), 
+        human_text = f"Human: {'YES' if human_detected else 'NO'} | Conf: {human_confidence:.2f}"
+        cv2.putText(vis_frame, human_text, (left_margin, text_y), 
                   font, font_scale, human_color, font_thickness)
         text_y += line_height
         
         # Add recording status
         should_record = detection_result.get("should_record", False)
         if should_record:
-            cv2.putText(vis_frame, "RECORDING", (10, text_y), 
+            cv2.putText(vis_frame, "RECORDING", (left_margin, text_y), 
                       font, font_scale, (0, 0, 255), font_thickness)
             text_y += line_height
         
         # Add YOLO information
         yolo_ran = not yolo_result.get("yolo_skipped", True)
-        yolo_text = f"YOLO: {'Active' if yolo_ran else 'Inactive'}"
+        yolo_text = f"YOLO: {'ON' if yolo_ran else 'OFF'}"
         if yolo_ran:
             inference_time = yolo_result.get("inference_time", 0)
-            yolo_text += f" | Time: {inference_time:.3f}s"
-        cv2.putText(vis_frame, yolo_text, (10, text_y), 
+            yolo_text += f" | Time: {inference_time:.2f}s"
+        cv2.putText(vis_frame, yolo_text, (left_margin, text_y), 
                   font, font_scale, (255, 255, 0), font_thickness)
         text_y += line_height
         
@@ -341,13 +346,22 @@ class IntegratedDetector:
         if objects:
             obj_classes = [obj["class"] for obj in objects]
             obj_count = len(objects)
-            obj_text = f"Objects: {obj_count} ({', '.join(obj_classes[:3])}{'...' if len(obj_classes) > 3 else ''})"
-            cv2.putText(vis_frame, obj_text, (10, text_y), 
+            # Use shorter format for object display
+            obj_text = f"Obj: {obj_count} [{', '.join(obj_classes[:2])}{'...' if len(obj_classes) > 2 else ''}]"
+            cv2.putText(vis_frame, obj_text, (left_margin, text_y), 
                       font, font_scale, (0, 255, 255), font_thickness)
+            text_y += line_height
         
-        # Add total detection time at the bottom of the frame
+        # Add a timestamp in the bottom left
+        timestamp = time.strftime("%H:%M:%S")
+        cv2.putText(vis_frame, timestamp, (left_margin, height - 5), 
+                  font, font_scale, (180, 180, 180), font_thickness)
+        
+        # Add total detection time in the bottom right - position dynamically based on text width
         detection_time = detection_result.get("detection_time", 0)
-        cv2.putText(vis_frame, f"Detection: {detection_time:.3f}s", (10, height - 20), 
+        det_text = f"Det: {detection_time:.2f}s"
+        text_size = cv2.getTextSize(det_text, font, font_scale, font_thickness)[0]
+        cv2.putText(vis_frame, det_text, (width - text_size[0] - 10, height - 5), 
                   font, font_scale, (0, 255, 0), font_thickness)
         
         return vis_frame

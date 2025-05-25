@@ -465,26 +465,29 @@ class MotionDetector:
             "likely_human": likely_human
         }
     
-    def visualize(self, frame: np.ndarray, detection_result: Dict[str, Any]) -> np.ndarray:
+    def visualize(self, frame: np.ndarray, detection_result: Dict[str, Any], show_text: bool = True) -> np.ndarray:
         """
         Visualize motion detection results on the frame.
         
         Args:
             frame: Original video frame
             detection_result: Result from detect() method
+            show_text: Whether to show text overlays (set to False when used in integrated detector)
             
         Returns:
             Frame with visualization overlays
         """
         output_frame = frame.copy()
         
-        # Draw ROI areas
+        # Draw ROI areas with thinner lines when used in integrated detector
+        line_thickness = 1 if not show_text else 2
+        
         for x, y, w, h in self.roi_areas:
-            cv2.rectangle(output_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.rectangle(output_frame, (x, y), (x+w, y+h), (0, 255, 0), line_thickness)
         
         # Draw motion bounding boxes with confidence-based colors
         confidence = detection_result.get("confidence", 0)
-        for x, y, w, h in detection_result["bounding_boxes"]:
+        for x, y, w, h in detection_result.get("bounding_boxes", []):
             # Color based on confidence level (red=high, orange=medium, yellow=low)
             if confidence == self.CONFIDENCE_HIGH:
                 color = (0, 0, 255)  # Red
@@ -493,22 +496,23 @@ class MotionDetector:
             else:
                 color = (0, 255, 255)  # Yellow
                 
-            cv2.rectangle(output_frame, (x, y), (x+w, y+h), color, 2)
+            cv2.rectangle(output_frame, (x, y), (x+w, y+h), color, line_thickness)
         
-        # Add text information
-        info_text = [
-            f"Motion: {'Yes' if detection_result['motion_detected'] else 'No'}",
-            f"Intensity: {detection_result['intensity']}",
-            f"Duration: {detection_result['duration']}s",
-            f"Confidence: {detection_result.get('confidence', 0)}",
-            f"{'Night' if detection_result.get('is_night_time', False) else 'Day'} Mode"
-        ]
-        
-        for i, text in enumerate(info_text):
-            cv2.putText(
-                output_frame, text, (10, 30 + i*30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
-            )
+        # Add text information only if show_text is True
+        if show_text:
+            info_text = [
+                f"Motion: {'Yes' if detection_result.get('motion_detected', False) else 'No'}",
+                f"Intensity: {detection_result.get('intensity', 0)}",
+                f"Duration: {detection_result.get('duration', 0)}s",
+                f"Confidence: {detection_result.get('confidence', 0)}",
+                f"{'Night' if detection_result.get('is_night_time', False) else 'Day'} Mode"
+            ]
+            
+            for i, text in enumerate(info_text):
+                cv2.putText(
+                    output_frame, text, (10, 30 + i*30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
+                )
         
         return output_frame
 
