@@ -12,6 +12,8 @@ import numpy as np
 import os
 import logging
 import time
+import json
+import copy
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -170,6 +172,44 @@ class InventoryDetectionTests:
                         -1)
         
         return before, after
+    
+    def _prepare_test_images(self, test_name, before_img, after_img):
+        """Helper to prepare and save test images."""
+        test_dir = os.path.join(self.test_dir, test_name)
+        os.makedirs(test_dir, exist_ok=True)
+        
+        before_path = os.path.join(test_dir, "before.jpg")
+        after_path = os.path.join(test_dir, "after.jpg")
+        
+        cv2.imwrite(before_path, before_img)
+        cv2.imwrite(after_path, after_img)
+        
+        return test_dir, before_path, after_path
+        
+    def _prepare_results_for_serialization(self, results):
+        """Helper to convert numpy arrays and non-serializable objects to JSON-compatible format."""
+        if not results:
+            return results
+            
+        # Deep copy to avoid modifying the original
+        serializable = copy.deepcopy(results)
+        
+        # Remove non-serializable image data
+        if "diff_image" in serializable:
+            serializable["diff_image"] = "[Image data removed for serialization]" if serializable["diff_image"] is not None else None
+            
+        # Handle numpy values by converting them to Python types
+        for key, value in serializable.items():
+            if isinstance(value, np.ndarray):
+                serializable[key] = value.tolist() if value.size > 0 else None
+            elif isinstance(value, np.integer):
+                serializable[key] = int(value)
+            elif isinstance(value, np.floating):
+                serializable[key] = float(value)
+            elif isinstance(value, dict):
+                serializable[key] = self._prepare_results_for_serialization(value)
+                
+        return serializable
     
     def test_lighting_invariance(self) -> Tuple[str, Dict[str, Any]]:
         """

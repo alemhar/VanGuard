@@ -17,8 +17,23 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
 
+# Custom JSON encoder to handle NumPy types
+class NumpyJSONEncoder(json.JSONEncoder):
+    """JSON encoder that handles NumPy data types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return super(NumpyJSONEncoder, self).default(obj)
+
 # Import local modules
 from utils.camera import CameraManager
+from utils.backend_client import BackendClient
 from detection.motion_detection import MotionDetector
 from detection.event_classification import EventClassifier
 from detection.object_detection.yolo_detector import YOLODetector
@@ -65,6 +80,9 @@ class SmartVanMonitor:
         # Initialize camera manager
         self.camera_manager = CameraManager()
         self._setup_cameras()
+        
+        # Initialize backend client for edge computing approach
+        self.backend_client = BackendClient(self.config, self.output_dir)
         
         # Initialize enhanced detection monitor (replaces individual detectors)
         try:
@@ -192,7 +210,16 @@ class SmartVanMonitor:
                 "post_motion_seconds": 3,
                 "min_recording_gap": 10
             },
-            "output_dir": "output"
+            "output_dir": "output",
+            # Backend communication settings
+            "backend": {
+                "server_url": "https://api.smartvan-monitor.com/v1",
+                "api_key": "",  # Must be provided for backend communication
+                "heartbeat_interval": 300,  # 5 minutes
+                "summary_interval": 3600,  # 1 hour
+                "max_retries": 3,
+                "retry_delay": 30
+            }
         }
         
         # Save default configuration
@@ -305,6 +332,9 @@ class SmartVanMonitor:
         # Start all cameras
         self.camera_manager.start_all_cameras()
         
+        # Start backend client
+        self.backend_client.start()
+        
         try:
             self._main_loop()
         except KeyboardInterrupt:
@@ -315,6 +345,11 @@ class SmartVanMonitor:
     def stop(self) -> None:
         """Stop the SmartVan Monitor system."""
         logger.info("Stopping SmartVan Monitor")
+        
+        # Stop backend client
+        self.backend_client.stop()
+        
+        # Stop cameras
         self.camera_manager.stop_all_cameras()
         self.camera_manager.cleanup()
     
@@ -324,6 +359,9 @@ class SmartVanMonitor:
         
         # Settings from configuration
         display = self.config.get("display", True)
+        
+        # Track last warning time for each camera to limit log frequency
+        self.last_warning_time = {}
         
         # Use the fine-tuned FPS settings from your optimization work
         # Get from first camera or use the default of 2 FPS for optimal detection
@@ -350,7 +388,12 @@ class SmartVanMonitor:
                 # Process each camera
                 for camera_name, (frame, timestamp, fps) in frames.items():
                     if frame is None:
-                        logger.warning(f"No frame received from {camera_name}")
+                        # Only log warning once every 3 seconds for each inactive camera
+                        current_time = time.time()
+                        last_warning = self.last_warning_time.get(camera_name, 0)
+                        if current_time - last_warning >= 3.0:  # 3 second interval between warnings
+                            logger.warning(f"No frame received from {camera_name}")
+                            self.last_warning_time[camera_name] = current_time
                         continue
                     
                     try:
@@ -536,7 +579,10 @@ class SmartVanMonitor:
         metadata_path = str(self.clips_dir / metadata_filename)
         
         with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=4)
+            json.dump(metadata, f, indent=4, cls=NumpyJSONEncoder)
+        
+        # Send event to backend using edge computing approach
+        self._send_to_backend(event_type, metadata)
         
         # Log event based on type
         log_message = f"Saved {event_type} event from {camera_name}"
@@ -550,6 +596,68 @@ class SmartVanMonitor:
         else:
             # Log other events at info level
             logger.info(log_message)
+            
+    def _send_to_backend(self, event_type: str, metadata: Dict[str, Any]):
+        """
+        Send event data to the backend using edge computing approach.
+        
+        Args:
+            event_type: Type of event
+            metadata: Event metadata
+        """
+        # Skip if backend client not initialized or API key not set
+        if not hasattr(self, 'backend_client') or not self.backend_client.api_key:
+            return
+        
+        # Determine priority based on event type
+        priority = "normal"
+        if event_type == "HUMAN_PRESENT" and metadata.get("human", {}).get("confidence", 0) > 0.8:
+            priority = "high"  # High priority for confident human detection
+        elif event_type == "INVENTORY_CHANGE":
+            priority = "high"  # High priority for inventory changes
+        
+        # For edge computing, we don't send all data - just the important bits
+        # Extract only the key information needed by the backend
+        edge_data = {
+            "van_id": metadata.get("van_id"),
+            "camera": metadata.get("camera"),
+            "timestamp": metadata.get("timestamp"),
+            "datetime": metadata.get("datetime"),
+            "event_type": event_type,
+            "event_id": metadata.get("motion_event_id", "")
+        }
+        
+        # Add human detection data if present
+        human_data = metadata.get("human", {})
+        if human_data.get("detected", False):
+            edge_data["human_detection"] = {
+                "confidence": human_data.get("confidence", 0),
+                "count": len(human_data.get("bounding_boxes", []))
+            }
+        
+        # Add inventory data if present
+        inventory_data = metadata.get("inventory", {})
+        if inventory_data:
+            edge_data["inventory"] = {
+                "zone_id": inventory_data.get("zone_id", ""),
+                "access_detected": inventory_data.get("access_detected", False),
+                "change_detected": inventory_data.get("change_detected", False),
+                "change_type": inventory_data.get("change_type", "")
+            }
+        
+        # Send to backend client
+        self.backend_client.send_event(edge_data, priority=priority)
+        
+        # Also send performance metrics if available
+        if hasattr(self, 'enhanced_monitor') and hasattr(self.enhanced_monitor, 'inventory_detector'):
+            inventory_detector = self.enhanced_monitor.inventory_detector
+            if hasattr(inventory_detector, 'performance_tracker'):
+                performance_tracker = inventory_detector.performance_tracker
+                if hasattr(performance_tracker, 'get_recent_metrics'):
+                    # Get recent performance metrics
+                    metrics = performance_tracker.get_recent_metrics()
+                    if metrics:
+                        self.backend_client.send_performance_metrics(metrics)
 
 
 if __name__ == "__main__":
@@ -561,6 +669,12 @@ if __name__ == "__main__":
                         help="Vibration filter threshold (0-100). Higher values filter more vibrations.")
     parser.add_argument("--van-id", type=str, default=None,
                         help="Unique identifier for this van. Overrides the config file setting.")
+    parser.add_argument("--backend-url", type=str, default=None,
+                        help="URL for the backend server. Overrides the config file setting.")
+    parser.add_argument("--api-key", type=str, default=None,
+                        help="API key for backend authentication. Overrides the config file setting.")
+    parser.add_argument("--heartbeat-interval", type=int, default=60,
+                        help="Interval in seconds for sending heartbeats to the backend.")
     args = parser.parse_args()
     
     # Load configuration
@@ -581,12 +695,30 @@ if __name__ == "__main__":
             monitor.config["motion_detection"] = monitor.config.get("motion_detection", {})
             monitor.config["motion_detection"]["vibration_threshold"] = args.vibration_filter
             
-        # Override van_id if specified on command line
+        # Add van_id if specified on command line
         if args.van_id:
             logger.info(f"Setting van identifier to: {args.van_id}")
             monitor.config["van_id"] = args.van_id
             # Make sure the enhanced monitor gets the updated van_id
             monitor.enhanced_monitor.van_id = args.van_id
+            # Update van_id in the backend client as well
+            monitor.backend_client.van_id = args.van_id
+            
+        # Override backend URL if specified on command line
+        if args.backend_url:
+            logger.info(f"Setting backend server URL to: {args.backend_url}")
+            if "backend" not in monitor.config:
+                monitor.config["backend"] = {}
+            monitor.config["backend"]["server_url"] = args.backend_url
+            monitor.backend_client.server_url = args.backend_url
+            
+        # Override API key if specified on command line
+        if args.api_key:
+            logger.info("Setting backend API key from command line")
+            if "backend" not in monitor.config:
+                monitor.config["backend"] = {}
+            monitor.config["backend"]["api_key"] = args.api_key
+            monitor.backend_client.api_key = args.api_key
         
         # Start the monitor
         monitor.start()

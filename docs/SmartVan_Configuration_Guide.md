@@ -56,6 +56,22 @@ These settings have been optimized for detecting human presence (inventory acces
 }
 ```
 
+### Inventory Detection Parameters
+
+```json
+"inventory_detection": {
+    "enabled": true,
+    "change_threshold": 0.15,
+    "min_change_area": 200,
+    "size_thresholds": {
+        "small": 500,
+        "medium": 2000
+    },
+    "zone_specific_settings": true,
+    "lighting_invariance": true
+}
+```
+
 ### Camera Settings
 
 ```json
@@ -123,6 +139,18 @@ These settings have been optimized for detecting human presence (inventory acces
 | `object_recording_threshold` | Confidence threshold to trigger recording | `0.6` |
 | `classes_of_interest` | COCO classes to detect | `["person", "backpack", "handbag", "suitcase", "bottle"]` |
 
+### Inventory Detection
+
+| Parameter | Description | Recommended Value |
+|-----------|-------------|------------------|
+| `enabled` | Whether inventory change detection is enabled | `true` |
+| `change_threshold` | Minimum percentage change to trigger detection | `0.15` |
+| `min_change_area` | Minimum contour area (in pixels) for items | `200` |
+| `size_thresholds.small` | Maximum area for small items | `500` |
+| `size_thresholds.medium` | Maximum area for medium items, larger is "large" | `2000` |
+| `zone_specific_settings` | Use zone-specific sensitivity settings | `true` |
+| `lighting_invariance` | Apply lighting-invariant detection techniques | `true` |
+
 ### System Settings
 
 | Parameter | Description | Recommended Value |
@@ -151,6 +179,7 @@ These settings have been optimized for detecting human presence (inventory acces
 - Increase `motion_intensity_threshold` (e.g., to 50-60)
 - Increase `movement_stability` (e.g., to 8-10)
 - Increase `min_alert_interval` (e.g., to 180-300)
+- Increase `min_change_area` for inventory detection (e.g., to 300-500)
 
 ## Command Line Options
 
@@ -187,6 +216,17 @@ python main.py --van-id FLEET_VAN_12 --vibration-filter 45 --no-display
 ```json
 {
     "van_id": "VAN001",
+    "inventory_detection": {
+        "enabled": true,
+        "change_threshold": 0.15,
+        "min_change_area": 200,
+        "size_thresholds": {
+            "small": 500,
+            "medium": 2000
+        },
+        "zone_specific_settings": true,
+        "lighting_invariance": true
+    },
     "cameras": [
         {
             "id": 0,

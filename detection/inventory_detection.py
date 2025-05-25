@@ -8,16 +8,24 @@ Key features:
 - Basic image differencing for change detection
 - Item removal/addition detection
 - Classification of inventory interaction events
+- Core performance metrics tracking
 """
 
 import cv2
 import numpy as np
-import time
-import logging
 import os
-from typing import Dict, List, Tuple, Optional, Any
+import time
+import json
+import logging
+import csv
+import pandas as pd
+import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Any, Tuple, Optional, Union
+
+# Import performance metrics tracker
+from detection.performance_metrics import PerformanceTracker
 
 # Configure logging
 logging.basicConfig(
@@ -48,7 +56,8 @@ class InventoryChangeDetector:
                 change_threshold: float = 0.15,   # Percentage change required for detection
                 min_change_area: int = 200,       # Minimum size of change area in pixels
                 state_memory_window: int = 3600,  # How long to remember inventory states (seconds)
-                config: Dict[str, Any] = None):   # Configuration dictionary
+                config: Dict[str, Any] = None,    # Configuration dictionary
+                enable_performance_tracking: bool = True):  # Whether to track performance metrics
         """
         Initialize the inventory change detector.
         
@@ -66,6 +75,7 @@ class InventoryChangeDetector:
         self.change_threshold = change_threshold
         self.min_change_area = min_change_area
         self.state_memory_window = state_memory_window
+        self.enable_performance_tracking = enable_performance_tracking
         
         # Initialize configuration dictionary
         self.config = config if config is not None else {}
@@ -77,6 +87,12 @@ class InventoryChangeDetector:
         # Track ongoing inventory access events
         # camera_name -> {"start_time": time, "zone_id": zone_id, "start_image": image}
         self.active_access_events = {}
+        
+        # Initialize performance tracking
+        if self.enable_performance_tracking:
+            # Create performance tracker instance
+            self.performance_tracker = PerformanceTracker(output_dir=str(self.output_dir))
+            logger.info(f"Performance tracking enabled")
         
         logger.info("Inventory change detector initialized")
         logger.info(f"Change threshold: {self.change_threshold}, Min area: {self.min_change_area}")
@@ -600,10 +616,28 @@ class InventoryChangeDetector:
                 event_type = self.EVENT_ITEM_ADDITION
                 confidence = self.CONFIDENCE_LOW  # Lower confidence due to mixed signals
             
-            # Draw contours on visualization with color based on event type
-            color = (0, 0, 255) if event_type == self.EVENT_ITEM_ADDITION else (255, 0, 0)
-            cv2.drawContours(diff_visualization, significant_contours, -1, color, 2)
+            # Track size distribution of changed items
+            size_distribution = {"small": 0, "medium": 0, "large": 0}
+            item_sizes = []
+            
+            # Process each significant contour for visualization and size analysis
+            for contour in significant_contours:
+                # Classify contour by size
+                size_class = self._classify_item_by_size(contour)
+                size_distribution[size_class] += 1
+                item_sizes.append(size_class)
                 
+                # Draw contours on visualization with color based on event type and size
+                if size_class == "small":
+                    thickness = 1
+                elif size_class == "medium":
+                    thickness = 2
+                else:  # large
+                    thickness = 3
+                    
+                color = (0, 0, 255) if event_type == self.EVENT_ITEM_ADDITION else (255, 0, 0)
+                cv2.drawContours(diff_visualization, [contour], -1, color, thickness)
+            
             # Higher confidence for longer interactions
             if duration > 5.0 and confidence < self.CONFIDENCE_HIGH:
                 confidence += 1
@@ -628,30 +662,113 @@ class InventoryChangeDetector:
                 "histogram_difference": float(hist_diff),
                 "texture_similarity": float(texture_similarity),
                 "normalized_change_score": float(self._calculate_normalized_change_score(change_percentage, len(significant_contours)))
-            }
+            },
+            # Add size-based classification information
+            "item_sizes": item_sizes if change_detected else [],
+            "size_distribution": size_distribution if change_detected else {"small": 0, "medium": 0, "large": 0},
+            "dominant_size": max(size_distribution, key=size_distribution.get) if change_detected and len(significant_contours) > 0 else "none"
         }
         
         # Apply serialization helper to ensure JSON compatibility
         result = self._ensure_json_serializable(result)
         
+        # Log this detection for performance tracking
+        if self.enable_performance_tracking:
+            self.performance_tracker.log_detection(result)
+        
         return result
+        
+    def update_environment_state(self, light_level: str = None, time_of_day: str = None) -> None:
+        """
+        Update the tracked environment state for performance correlation.
+        
+        Args:
+            light_level: Current light level (e.g., 'dark', 'normal', 'bright')
+            time_of_day: Current time of day (e.g., 'day', 'night')
+        """
+        if self.enable_performance_tracking:
+            self.performance_tracker.update_environment_state(light_level, time_of_day)
     
-    def _ensure_json_serializable(self, data):
-        if isinstance(data, dict):
-            return {self._ensure_json_serializable(key): self._ensure_json_serializable(value) for key, value in data.items()}
-        elif isinstance(data, list):
-            return [self._ensure_json_serializable(item) for item in data]
-        elif isinstance(data, np.ndarray):
-            return data.tolist()
-        elif isinstance(data, np.float64):
-            return float(data)
-        elif isinstance(data, np.int64):
-            return int(data)
-        else:
-            return data
+    def update_vehicle_state(self, is_moving: bool = None, movement_type: str = None) -> None:
+        """
+        Update the tracked vehicle state for performance correlation.
+        
+        Args:
+            is_moving: Whether the vehicle is currently moving
+            movement_type: Type of movement (e.g., 'stationary', 'driving', 'stop_and_go')
+        """
+        if self.enable_performance_tracking:
+            self.performance_tracker.update_vehicle_state(is_moving, movement_type)
     
-    def _calculate_histogram(self, img):
-        """Calculate histogram for an image"""
+    def log_user_feedback(self, detection_id: str, feedback_type: str, 
+                         is_correct: bool, notes: str = None,
+                         camera: str = None, zone: str = None) -> None:
+        """
+        Log user feedback about a detection result.
+        
+        Args:
+            detection_id: Identifier for the detection event
+            feedback_type: Type of feedback (e.g., 'manual_review', 'alert_response')
+            is_correct: Whether the detection was correct according to user
+            notes: Optional notes from the user
+            camera: Camera name (if known)
+            zone: Zone ID (if known)
+        """
+        if self.enable_performance_tracking:
+            self.performance_tracker.log_user_feedback(
+                detection_id, feedback_type, is_correct, notes, camera, zone
+            )
+            
+    def generate_performance_report(self, start_time: float = None, 
+                                 end_time: float = None,
+                                 output_format: str = "html") -> str:
+        """
+        Generate a performance report for the specified time period.
+        
+        Args:
+            start_time: Start of analysis period (default: 24 hours ago)
+            end_time: End of analysis period (default: now)
+            output_format: Format of the report ('html', 'markdown', 'json')
+            
+        Returns:
+            Report in the specified format
+        """
+        if not self.enable_performance_tracking:
+            return "Performance tracking not enabled"
+            
+        return self.performance_tracker.generate_report(
+            start_time, end_time, output_format
+        )
+    
+    def generate_performance_visualizations(self, start_time: float = None, 
+                                          end_time: float = None) -> Dict[str, str]:
+        """
+        Generate visualizations for performance metrics.
+        
+        Args:
+            start_time: Start of analysis period (default: 24 hours ago)
+            end_time: End of analysis period (default: now)
+            
+        Returns:
+            Dictionary mapping chart types to file paths
+        """
+        if not self.enable_performance_tracking:
+            return {"error": "Performance tracking not enabled"}
+            
+        return self.performance_tracker.generate_visualizations(
+            start_time, end_time
+        )
+
+    def _calculate_histogram(self, img: np.ndarray) -> np.ndarray:
+        """
+        Calculate a histogram of the given image.
+        
+        Args:
+            img: Input image
+        
+        Returns:
+            Histogram of the image
+        """
         # Convert to grayscale if needed
         if len(img.shape) > 2:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -1116,7 +1233,8 @@ class InventoryChangeDetector:
     
     def _categorize_change_pattern(self, before_image: np.ndarray, after_image: np.ndarray) -> str:
         """
-        Categorize the pattern of change between before and after images.
+        Categorize the pattern of change between before and after images,
+        including item size and spatial distribution information.
         
         Args:
             before_image: Image before inventory access
@@ -1141,15 +1259,22 @@ class InventoryChangeDetector:
         # Filter contours by size
         significant_contours = [c for c in contours if cv2.contourArea(c) > self.min_change_area]
         
+        # Track size distribution of items
+        size_distribution = {"small": 0, "medium": 0, "large": 0}
+        
         # Analyze contour locations and patterns
         if len(significant_contours) == 0:
             return "NO_CHANGE"
-            
+        
         # Determine if changes are concentrated in one area or distributed
         height, width = before_gray.shape
         quadrants_with_changes = set()
         
         for c in significant_contours:
+            # Classify item by size
+            size_class = self._classify_item_by_size(c)
+            size_distribution[size_class] += 1
+            
             # Get contour center
             M = cv2.moments(c)
             if M["m00"] != 0:
@@ -1169,13 +1294,38 @@ class InventoryChangeDetector:
                     
                 quadrants_with_changes.add(quadrant)
         
-        # Determine pattern based on quadrant distribution
+        # Get dominant size category
+        dominant_size = max(size_distribution, key=size_distribution.get) if sum(size_distribution.values()) > 0 else "none"
+        
+        # Determine pattern based on quadrant distribution and size
         if len(quadrants_with_changes) == 1:
-            return "SINGLE_AREA_CHANGE"
+            return f"SINGLE_AREA_{dominant_size.upper()}_CHANGE"
         elif len(quadrants_with_changes) == 2:
-            return "DUAL_AREA_CHANGE"
+            return f"DUAL_AREA_{dominant_size.upper()}_CHANGE"
         else:
-            return "DISTRIBUTED_CHANGE"
+            return f"DISTRIBUTED_{dominant_size.upper()}_CHANGE"
+    
+    def _classify_item_by_size(self, contour) -> str:
+        """
+        Classify an item (contour) by its size.
+        
+        Args:
+            contour: The contour representing the item
+            
+        Returns:
+            str: Size classification ('small', 'medium', 'large')
+        """
+        # Get contour area
+        area = cv2.contourArea(contour)
+        
+        # Define thresholds for size classification
+        # These thresholds can be adjusted based on typical item sizes in the inventory
+        if area < 500:  # Small items (e.g., tools, small boxes)
+            return "small"
+        elif area < 2000:  # Medium items (e.g., medium boxes, containers)
+            return "medium"
+        else:  # Large items (e.g., large boxes, equipment)
+            return "large"
     
     def _estimate_item_count_change(self, change_result: Dict[str, Any]) -> int:
         """
@@ -1298,13 +1448,24 @@ class InventoryChangeDetector:
             event_type = results.get("event_type", "UNKNOWN")
             confidence = results.get("confidence", 0)
             change_pct = results.get("change_percentage", 0) * 100
+            dominant_size = results.get("dominant_size", "none")
             
             # Position text at top of frame
             text_lines = [
                 f"Change: {event_type}",
                 f"Confidence: {confidence}",
-                f"Changed: {change_pct:.1f}%"
+                f"Changed: {change_pct:.1f}%",
+                f"Size: {dominant_size.capitalize()}"
             ]
+            
+            # Add size distribution if available
+            if "size_distribution" in results:
+                size_dist = results["size_distribution"]
+                if sum(size_dist.values()) > 0:
+                    small = size_dist.get("small", 0)
+                    medium = size_dist.get("medium", 0)
+                    large = size_dist.get("large", 0)
+                    text_lines.append(f"Items: S:{small} M:{medium} L:{large}")
             
             for i, text in enumerate(text_lines):
                 cv2.putText(
@@ -1320,3 +1481,4 @@ class InventoryChangeDetector:
         return vis_frame
 
 # End of file
+
