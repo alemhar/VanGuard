@@ -600,10 +600,28 @@ class InventoryChangeDetector:
                 event_type = self.EVENT_ITEM_ADDITION
                 confidence = self.CONFIDENCE_LOW  # Lower confidence due to mixed signals
             
-            # Draw contours on visualization with color based on event type
-            color = (0, 0, 255) if event_type == self.EVENT_ITEM_ADDITION else (255, 0, 0)
-            cv2.drawContours(diff_visualization, significant_contours, -1, color, 2)
+            # Track size distribution of changed items
+            size_distribution = {"small": 0, "medium": 0, "large": 0}
+            item_sizes = []
+            
+            # Process each significant contour for visualization and size analysis
+            for contour in significant_contours:
+                # Classify contour by size
+                size_class = self._classify_item_by_size(contour)
+                size_distribution[size_class] += 1
+                item_sizes.append(size_class)
                 
+                # Draw contours on visualization with color based on event type and size
+                if size_class == "small":
+                    thickness = 1
+                elif size_class == "medium":
+                    thickness = 2
+                else:  # large
+                    thickness = 3
+                    
+                color = (0, 0, 255) if event_type == self.EVENT_ITEM_ADDITION else (255, 0, 0)
+                cv2.drawContours(diff_visualization, [contour], -1, color, thickness)
+            
             # Higher confidence for longer interactions
             if duration > 5.0 and confidence < self.CONFIDENCE_HIGH:
                 confidence += 1
@@ -628,7 +646,11 @@ class InventoryChangeDetector:
                 "histogram_difference": float(hist_diff),
                 "texture_similarity": float(texture_similarity),
                 "normalized_change_score": float(self._calculate_normalized_change_score(change_percentage, len(significant_contours)))
-            }
+            },
+            # Add size-based classification information
+            "item_sizes": item_sizes if change_detected else [],
+            "size_distribution": size_distribution if change_detected else {"small": 0, "medium": 0, "large": 0},
+            "dominant_size": max(size_distribution, key=size_distribution.get) if change_detected and len(significant_contours) > 0 else "none"
         }
         
         # Apply serialization helper to ensure JSON compatibility
@@ -1116,7 +1138,8 @@ class InventoryChangeDetector:
     
     def _categorize_change_pattern(self, before_image: np.ndarray, after_image: np.ndarray) -> str:
         """
-        Categorize the pattern of change between before and after images.
+        Categorize the pattern of change between before and after images,
+        including item size and spatial distribution information.
         
         Args:
             before_image: Image before inventory access
@@ -1141,15 +1164,22 @@ class InventoryChangeDetector:
         # Filter contours by size
         significant_contours = [c for c in contours if cv2.contourArea(c) > self.min_change_area]
         
+        # Track size distribution of items
+        size_distribution = {"small": 0, "medium": 0, "large": 0}
+        
         # Analyze contour locations and patterns
         if len(significant_contours) == 0:
             return "NO_CHANGE"
-            
+        
         # Determine if changes are concentrated in one area or distributed
         height, width = before_gray.shape
         quadrants_with_changes = set()
         
         for c in significant_contours:
+            # Classify item by size
+            size_class = self._classify_item_by_size(c)
+            size_distribution[size_class] += 1
+            
             # Get contour center
             M = cv2.moments(c)
             if M["m00"] != 0:
@@ -1169,13 +1199,38 @@ class InventoryChangeDetector:
                     
                 quadrants_with_changes.add(quadrant)
         
-        # Determine pattern based on quadrant distribution
+        # Get dominant size category
+        dominant_size = max(size_distribution, key=size_distribution.get) if sum(size_distribution.values()) > 0 else "none"
+        
+        # Determine pattern based on quadrant distribution and size
         if len(quadrants_with_changes) == 1:
-            return "SINGLE_AREA_CHANGE"
+            return f"SINGLE_AREA_{dominant_size.upper()}_CHANGE"
         elif len(quadrants_with_changes) == 2:
-            return "DUAL_AREA_CHANGE"
+            return f"DUAL_AREA_{dominant_size.upper()}_CHANGE"
         else:
-            return "DISTRIBUTED_CHANGE"
+            return f"DISTRIBUTED_{dominant_size.upper()}_CHANGE"
+    
+    def _classify_item_by_size(self, contour) -> str:
+        """
+        Classify an item (contour) by its size.
+        
+        Args:
+            contour: The contour representing the item
+            
+        Returns:
+            str: Size classification ('small', 'medium', 'large')
+        """
+        # Get contour area
+        area = cv2.contourArea(contour)
+        
+        # Define thresholds for size classification
+        # These thresholds can be adjusted based on typical item sizes in the inventory
+        if area < 500:  # Small items (e.g., tools, small boxes)
+            return "small"
+        elif area < 2000:  # Medium items (e.g., medium boxes, containers)
+            return "medium"
+        else:  # Large items (e.g., large boxes, equipment)
+            return "large"
     
     def _estimate_item_count_change(self, change_result: Dict[str, Any]) -> int:
         """
@@ -1298,13 +1353,24 @@ class InventoryChangeDetector:
             event_type = results.get("event_type", "UNKNOWN")
             confidence = results.get("confidence", 0)
             change_pct = results.get("change_percentage", 0) * 100
+            dominant_size = results.get("dominant_size", "none")
             
             # Position text at top of frame
             text_lines = [
                 f"Change: {event_type}",
                 f"Confidence: {confidence}",
-                f"Changed: {change_pct:.1f}%"
+                f"Changed: {change_pct:.1f}%",
+                f"Size: {dominant_size.capitalize()}"
             ]
+            
+            # Add size distribution if available
+            if "size_distribution" in results:
+                size_dist = results["size_distribution"]
+                if sum(size_dist.values()) > 0:
+                    small = size_dist.get("small", 0)
+                    medium = size_dist.get("medium", 0)
+                    large = size_dist.get("large", 0)
+                    text_lines.append(f"Items: S:{small} M:{medium} L:{large}")
             
             for i, text in enumerate(text_lines):
                 cv2.putText(
