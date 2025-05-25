@@ -360,6 +360,9 @@ class SmartVanMonitor:
         # Settings from configuration
         display = self.config.get("display", True)
         
+        # Track last warning time for each camera to limit log frequency
+        self.last_warning_time = {}
+        
         # Use the fine-tuned FPS settings from your optimization work
         # Get from first camera or use the default of 2 FPS for optimal detection
         cameras_config = self.config.get("cameras", [])
@@ -385,7 +388,12 @@ class SmartVanMonitor:
                 # Process each camera
                 for camera_name, (frame, timestamp, fps) in frames.items():
                     if frame is None:
-                        logger.warning(f"No frame received from {camera_name}")
+                        # Only log warning once every 3 seconds for each inactive camera
+                        current_time = time.time()
+                        last_warning = self.last_warning_time.get(camera_name, 0)
+                        if current_time - last_warning >= 3.0:  # 3 second interval between warnings
+                            logger.warning(f"No frame received from {camera_name}")
+                            self.last_warning_time[camera_name] = current_time
                         continue
                     
                     try:
