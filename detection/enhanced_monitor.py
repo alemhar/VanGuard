@@ -54,6 +54,14 @@ class EnhancedDetectionMonitor:
             
         self.output_dir.mkdir(exist_ok=True)
         
+        # Get van_id from configuration - check both possible locations
+        if "van_id" in self.original_config:
+            self.van_id = self.original_config.get("van_id")
+        else:
+            self.van_id = self.config.get("system", {}).get("van_id", "VAN001")
+            
+        logger.info(f"EnhancedDetectionMonitor initialized for van: {self.van_id}")
+        
         # Initialize core components
         self._setup_components()
         
@@ -88,7 +96,8 @@ class EnhancedDetectionMonitor:
             business_hours_end=event_config.get("business_hours_end", 19),
             high_frequency_threshold=event_config.get("high_frequency_threshold", 5),
             high_frequency_window=event_config.get("high_frequency_window", 900),
-            min_alert_interval=event_config.get("min_alert_interval", 120)
+            min_alert_interval=event_config.get("min_alert_interval", 120),
+            van_id=self.van_id  # Pass van_id to ensure all events include it
         )
         
         # Initialize inventory detector
@@ -98,15 +107,11 @@ class EnhancedDetectionMonitor:
             min_change_area=inventory_config.get("min_change_area", 200)
         )
         
-        # Initialize inventory tracker
+        # Initialize inventory tracker with the updated constructor signature
         self.inventory_tracker = InventoryTracker(
-            inventory_detector=self.inventory_detector,
+            config=inventory_config,  # Pass the entire inventory config section
             event_classifier=self.event_classifier,
-            config={
-                "access_timeout": inventory_config.get("access_timeout", 5.0),
-                "human_confidence_threshold": inventory_config.get("human_confidence_threshold", 0.5),
-                "enabled": inventory_config.get("enabled", True)
-            }
+            van_id=self.van_id  # Pass van_id for fleet tracking
         )
         
         # Initialize detector collections - to be populated per camera
@@ -291,13 +296,17 @@ class EnhancedDetectionMonitor:
                 logger.debug(f"Filtered with custom threshold: {detection_result.get('intensity', 0)} (threshold: {custom_threshold})")
                 
         
-        # Add timestamp to detection result
+        # Add timestamp and van_id to detection result for backend correlation
         detection_result["timestamp"] = timestamp
+        detection_result["van_id"] = self.van_id
         
         # Process with inventory tracker for enhanced information
         enhanced_result = self.inventory_tracker.process_detection(
             camera_name, frame, detection_result, timestamp
         )
+        
+        # Make sure van_id is preserved in the enhanced result
+        enhanced_result["van_id"] = self.van_id
         
         # Create events based on detection results
         self._create_events_from_detection(camera_name, enhanced_result, timestamp)
@@ -327,59 +336,6 @@ class EnhancedDetectionMonitor:
         # Get inventory tracking data
         inventory_tracking = detection_result.get("inventory_tracking", {})
         inventory_access = inventory_tracking.get("inventory_access_detected", False)
-        inventory_change = inventory_tracking.get("inventory_change_detected", False)
-        
-        # Create a motion event if motion is detected and it's not just vibration
-        # or if vibration is significant enough
-        if motion_detected and (not motion_is_vibration or motion_intensity > 40):
-            motion_event = self.event_classifier.create_event(
-                camera_name=camera_name,
-                event_category=self.event_classifier.CATEGORY_MOTION,
-                event_type=self.event_classifier.EVENT_MOTION,
-                detection_data={
-                    "intensity": motion_intensity,
-                    "is_vibration": motion_is_vibration,
-                    "bounding_boxes": detection_result.get("bounding_boxes", []),
-                    "duration": detection_result.get("duration", 0)
-                },
-                timestamp=timestamp
-            )
-            
-            # Save motion event ID for reference
-            detection_result["motion_event_id"] = motion_event["event_id"]
-        
-        # Create a human event if human is detected with sufficient confidence
-        if human_detected and human_confidence >= 0.5:
-            human_event = self.event_classifier.create_event(
-                camera_name=camera_name,
-                event_category=self.event_classifier.CATEGORY_HUMAN,
-                event_type=self.event_classifier.EVENT_HUMAN_PRESENT,
-                detection_data={
-                    "human_confidence": human_confidence,
-                    "objects_detected": detection_result.get("objects_detected", []),
-                    "motion_intensity": motion_intensity
-                },
-                timestamp=timestamp,
-                # Link to motion event if it exists
-                related_event_id=detection_result.get("motion_event_id")
-            )
-            
-            # Save human event ID for reference
-            detection_result["human_event_id"] = human_event["event_id"]
-        
-        # Inventory events are handled by the inventory tracker
-        # but we can reference them here if needed
-        if "inventory_event" in inventory_tracking:
-            inventory_event = inventory_tracking["inventory_event"]
-            detection_result["inventory_event_id"] = inventory_event["event_id"]
-            
-            # If this is a significant inventory event, flag it for attention
-            if inventory_event["type"] in [
-                self.event_classifier.EVENT_ITEM_REMOVAL,
-                self.event_classifier.EVENT_ITEM_ADDITION
-            ] and inventory_event["confidence"] >= self.event_classifier.CONFIDENCE_MEDIUM:
-                detection_result["significant_inventory_event"] = True
-    
     def should_record(self, detection_result: Dict[str, Any]) -> bool:
         """
         Determine if the current detection should trigger recording.

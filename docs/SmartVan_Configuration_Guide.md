@@ -123,6 +123,15 @@ These settings have been optimized for detecting human presence (inventory acces
 | `object_recording_threshold` | Confidence threshold to trigger recording | `0.6` |
 | `classes_of_interest` | COCO classes to detect | `["person", "backpack", "handbag", "suitcase", "bottle"]` |
 
+### System Settings
+
+| Parameter | Description | Recommended Value |
+|-----------|-------------|------------------|
+| `van_id` | Unique identifier for this vehicle in the fleet | `"VAN001"` |
+| `display` | Whether to display video feed | `true` |
+| `output_dir` | Directory for storing output files | `"output"` |
+| `log_level` | Logging level (INFO, DEBUG, WARNING, ERROR) | `"INFO"` |
+
 ### Camera Settings
 
 | Parameter | Description | Recommended Value |
@@ -143,10 +152,41 @@ These settings have been optimized for detecting human presence (inventory acces
 - Increase `movement_stability` (e.g., to 8-10)
 - Increase `min_alert_interval` (e.g., to 180-300)
 
+## Command Line Options
+
+The SmartVan Monitor supports several command-line options that can override settings in the configuration file:
+
+| Option | Description | Example |
+|--------|-------------|--------|
+| `--config` | Path to configuration file | `--config fleet_van12.json` |
+| `--no-display` | Disable video display window | `--no-display` |
+| `--vibration-filter` | Set vibration filter threshold (0-100) | `--vibration-filter 45` |
+| `--van-id` | Set unique van identifier | `--van-id FLEET_VAN_12` |
+
+### Examples
+
+```bash
+# Basic usage with default config.json
+python main.py
+
+# Specify a different config file
+python main.py --config delivery_van.json
+
+# Run in headless mode (no display)
+python main.py --no-display
+
+# Set a specific van ID for fleet deployment
+python main.py --van-id DELIVERY_VAN_42
+
+# Combine multiple options
+python main.py --van-id FLEET_VAN_12 --vibration-filter 45 --no-display
+```
+
 ## Example config.json
 
 ```json
 {
+    "van_id": "VAN001",
     "cameras": [
         {
             "id": 0,

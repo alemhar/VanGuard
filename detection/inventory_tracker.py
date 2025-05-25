@@ -33,44 +33,45 @@ class InventoryTracker:
     """
     
     def __init__(self, 
-                 inventory_detector: InventoryChangeDetector,
+                 config: Dict[str, Any], 
                  event_classifier: EnhancedEventClassifier,
-                 config: Dict[str, Any] = None):
+                 van_id: str = "VAN001"):
         """
         Initialize the inventory tracker.
         
         Args:
-            inventory_detector: InventoryChangeDetector instance
-            event_classifier: EnhancedEventClassifier instance
-            config: Configuration dictionary for inventory tracking
+            config: Inventory detection configuration
+            event_classifier: Event classifier instance
+            van_id: Unique identifier for this van
         """
-        self.inventory_detector = inventory_detector
+        self.config = config
         self.event_classifier = event_classifier
+        self.van_id = van_id
         
         # Default configuration
-        self.config = {
-            "access_timeout": 10.0,  # Seconds after access event to check for changes
-            "human_confidence_threshold": 0.5,  # Minimum confidence for human detection
-            "change_confidence_threshold": 0.6,  # Minimum confidence for change detection
-            "enabled": True  # Whether inventory tracking is enabled
-        }
+        self.config.setdefault("access_timeout", 10.0)  # Seconds after access event to check for changes
+        self.config.setdefault("human_confidence_threshold", 0.5)  # Minimum confidence for human detection
+        self.config.setdefault("change_confidence_threshold", 0.6)  # Minimum confidence for change detection
+        self.config.setdefault("enabled", True)  # Whether inventory tracking is enabled
         
-        # Update with provided config
-        if config:
-            self.config.update(config)
-        
-        # Active inventory access sessions
-        # camera_name -> {
-        #    "zone_id": zone_id,
-        #    "start_time": timestamp,
-        #    "start_event_id": event_id,
-        #    "last_update": timestamp,
-        #    "status": "active"|"pending_verification"
-        # }
+        # Track inventory access sessions per camera
         self.active_sessions = {}
         
-        # Store previous frames for each camera to use as reference
+        # Store previous frames for analysis
         self.prev_frames = {}
+        
+        # Initialize inventory change detector
+        # Extract the output_dir and other parameters from config
+        output_dir = self.config.get("output_dir", "output")
+        change_threshold = self.config.get("change_threshold", 0.08)
+        min_change_area = self.config.get("min_change_area", 200)
+        
+        # Initialize with the correct parameters
+        self.change_detector = InventoryChangeDetector(
+            output_dir=output_dir,
+            change_threshold=change_threshold,
+            min_change_area=min_change_area
+        )
         
         logger.info("Inventory tracker initialized")
         if self.config["enabled"]:
@@ -86,7 +87,7 @@ class InventoryTracker:
             zones_config: Dictionary mapping camera names to lists of zone definitions
         """
         for camera_name, zones in zones_config.items():
-            self.inventory_detector.register_inventory_zones(camera_name, zones)
+            self.change_detector.register_inventory_zones(camera_name, zones)
             logger.info(f"Registered {len(zones)} inventory zones for camera {camera_name}")
     
     def update_frame(self, camera_name: str, frame: np.ndarray, timestamp: float = None):
@@ -180,7 +181,7 @@ class InventoryTracker:
                         camera_name=camera_name,
                         event_category=self.event_classifier.CATEGORY_INVENTORY,
                         event_type=change_result["event_type"],
-                        detection_data=change_result,
+                        detection_data={**change_result, "van_id": self.van_id},
                         timestamp=timestamp,
                         related_event_id=session.get("start_event_id")
                     )
@@ -210,7 +211,8 @@ class InventoryTracker:
                     event_type=self.event_classifier.EVENT_INVENTORY_ACCESS,
                     detection_data={
                         "human_confidence": human_confidence,
-                        "zone_id": zone_id
+                        "zone_id": zone_id,
+                        "van_id": self.van_id
                     },
                     timestamp=timestamp
                 )
@@ -227,7 +229,7 @@ class InventoryTracker:
                 self.active_sessions[camera_name] = session
                 
                 # Start inventory access in the detector
-                access_start = self.inventory_detector.start_inventory_access(
+                access_start = self.change_detector.start_inventory_access(
                     camera_name, frame, zone_id, timestamp
                 )
                 
@@ -312,7 +314,7 @@ class InventoryTracker:
         zone_id = session["zone_id"]
         
         # End inventory access in the detector
-        change_result = self.inventory_detector.end_inventory_access(
+        change_result = self.change_detector.end_inventory_access(
             camera_name, frame, zone_id, timestamp
         )
         
@@ -346,7 +348,7 @@ class InventoryTracker:
             return frame
             
         # Start with inventory detector visualization
-        vis_frame = self.inventory_detector.visualize(frame, camera_name)
+        vis_frame = self.change_detector.visualize(frame, camera_name)
         
         # If we have detection results with inventory data, add that
         if detection_result and "inventory_tracking" in detection_result:

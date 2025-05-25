@@ -126,6 +126,9 @@ class SmartVanMonitor:
         
         # Default configuration
         config = {
+            # Add van_id for fleet identification
+            "van_id": "VAN001",  # Default identifier, should be unique per vehicle
+            
             "cameras": [
                 {
                     "id": 0,
@@ -468,6 +471,7 @@ class SmartVanMonitor:
         
         # Build comprehensive metadata
         metadata = {
+            "van_id": detection_result.get("van_id", self.config.get("van_id", "VAN001")),  # Include van_id for fleet identification
             "camera": camera_name,
             "timestamp": timestamp,
             "datetime": dt.isoformat(),
@@ -555,6 +559,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-display", action="store_true", help="Disable video display")
     parser.add_argument("--vibration-filter", type=int, default=40, 
                         help="Vibration filter threshold (0-100). Higher values filter more vibrations.")
+    parser.add_argument("--van-id", type=str, default=None,
+                        help="Unique identifier for this van. Overrides the config file setting.")
     args = parser.parse_args()
     
     # Load configuration
@@ -574,6 +580,13 @@ if __name__ == "__main__":
             # This will be picked up by the EnhancedDetectionMonitor's process_frame method
             monitor.config["motion_detection"] = monitor.config.get("motion_detection", {})
             monitor.config["motion_detection"]["vibration_threshold"] = args.vibration_filter
+            
+        # Override van_id if specified on command line
+        if args.van_id:
+            logger.info(f"Setting van identifier to: {args.van_id}")
+            monitor.config["van_id"] = args.van_id
+            # Make sure the enhanced monitor gets the updated van_id
+            monitor.enhanced_monitor.van_id = args.van_id
         
         # Start the monitor
         monitor.start()

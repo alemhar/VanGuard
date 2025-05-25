@@ -76,7 +76,8 @@ DEFAULT_CONFIG = {
     "system": {
         "display": True,             # Whether to display video feed
         "output_dir": "output",      # Directory for output files
-        "log_level": "INFO"          # Logging level
+        "log_level": "INFO",         # Logging level
+        "van_id": "VAN001"           # Unique identifier for this van
     }
 }
 
