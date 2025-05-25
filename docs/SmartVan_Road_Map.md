@@ -19,12 +19,10 @@ Focus on core functionality to detect basic theft patterns with minimal hardware
 - **Simple Event Categorization**:
   - High-frequency access alerts
   - After-hours inventory access
-- **Offline Storage**:
-  - Local database of events
-  - Video clip storage of flagged events only (to conserve space)
-- **Manual Synchronization**:
-  - End-of-day upload when connected to depot WiFi
-  - Basic integration with existing backend via simple API
+- **Basic Event Recording**:
+  - Simple image capture of motion events
+  - Minimal metadata storage
+  - Confidence scoring for detected events
 
 ### Key MVP Metrics
 - Detection of inventory access: 90% accuracy
@@ -58,13 +56,16 @@ Improve detection accuracy and add more sophisticated behavioral analysis.
 - **Transaction Correlation**:
   - Match inventory access events with POS transactions
   - Flag discrepancies between inventory movement and sales
-- **Automatic Synchronization**:
-  - Scheduled uploads when connectivity available
-  - Intelligent bandwidth management
-  - Prioritized event uploading
+- **Storage Management**:
+  - Local database of events
+  - Video clip storage of flagged events only
+  - Storage optimization and cleanup
+- **Basic Synchronization**:
+  - End-of-day upload when connected to depot WiFi
+  - Basic integration with existing backend via simple API
 - **Alert System**:
-  - Real-time alerts for critical events when online
-  - Severity classification
+  - Simple alerts for critical events
+  - Basic severity classification
 
 ### Phase 2 Metrics
 - Detection accuracy: >95% for inventory access
@@ -73,7 +74,7 @@ Improve detection accuracy and add more sophisticated behavioral analysis.
 - Automatic sync success rate: >90%
 
 ## Phase 3: Enterprise Solution (Months 7-12)
-Scale to fleet-wide deployment with advanced analytics and integration capabilities.
+Scale to fleet-wide deployment with advanced analytics, robust storage, and enhanced synchronization capabilities.
 
 ### Hardware Finalization
 - **Hardened Existing Hardware**:
@@ -94,6 +95,11 @@ Scale to fleet-wide deployment with advanced analytics and integration capabilit
   - Predictive theft prevention
   - Staff behavior analysis
   - Automatic inventory reconciliation
+- **Advanced Synchronization**:
+  - Scheduled uploads when connectivity available
+  - Intelligent bandwidth management
+  - Prioritized event uploading
+  - Real-time alerts for critical events when online
 - **Deep Backend Integration**:
   - Bi-directional data flow with inventory systems
   - Automated reporting and compliance

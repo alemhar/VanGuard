@@ -6,7 +6,17 @@
 
 ### 1. Detection Reliability
 **Q:** How will you ensure the system can reliably distinguish between legitimate inventory access and potential theft in various lighting conditions?
-**A:** 
+**A:** Our VanGuard system will employ a multi-layered approach to differentiate legitimate inventory access from potential theft in any lighting condition:
+
+1. **Advanced computer vision with infrared capabilities**: The system will utilize cameras with infrared technology to maintain visual monitoring regardless of lighting conditions, ensuring consistent detection even in low-light environments.
+
+2. **Process validation**: Since theft primarily occurs when personnel fail to log transactions in the portable POS system, our solution will correlate physical item access with digital transaction logs in real-time. Any discrepancy between inventory removal and transaction records will trigger an alert.
+
+3. **Package integrity monitoring**: The system will detect when main packages are opened rather than taken whole, and will track whether the items removed correspond to entered sales orders. If items are removed without corresponding entries, the system will flag this activity for review.
+
+4. **Machine learning algorithms**: Our system will continuously learn normal access patterns versus suspicious behavior, improving accuracy over time while adapting to each team's legitimate operational habits.
+
+5. **Multi-sensor fusion**: By combining data from various sensors (motion, weight, RFID where applicable), the system can maintain reliable detection capabilities even when lighting conditions might compromise pure camera-based solutions.
 
 ### 2. Computer Vision Algorithms
 **Q:** What specific computer vision algorithms are you planning to implement for the detection system, and have you tested their efficacy in mobile, vibrating environments?
