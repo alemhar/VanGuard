@@ -444,6 +444,89 @@ class EnhancedEventClassifier:
         
         return event
     
+    def _process_motion_event(self, camera_name: str, motion_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Process motion detection data to determine if it qualifies as an event.
+        Enhanced with improved vibration filtering.
+        
+        Args:
+            camera_name: Name of the camera that captured the motion
+            motion_data: Motion detection data
+            
+        Returns:
+            Event data dictionary or None if no event should be created
+        """
+        if not motion_data.get("motion_detected", False):
+            return None
+        
+        # Enhanced vibration analysis data
+        intensity = motion_data.get("intensity", 0)
+        is_vibration = motion_data.get("is_vibration", False)
+        vibration_confidence = motion_data.get("vibration_confidence", 0.0)
+        vibration_type = motion_data.get("vibration_type", "UNKNOWN")
+        likely_human = motion_data.get("likely_human", False)
+        human_confidence = motion_data.get("human_confidence", 0.0)
+        motion_confidence = motion_data.get("confidence", 0)
+        
+        # Early rejection of very low intensity events
+        if intensity < self.motion_intensity_threshold * 0.5:
+            self.logger.debug(f"Rejecting low intensity motion: {intensity}")
+            return None
+            
+        # Enhanced vibration filtering: reject high-confidence vibrations
+        if is_vibration and vibration_confidence > 0.7 and intensity < self.motion_intensity_threshold * 1.5:
+            self.logger.debug(f"Rejecting high-confidence vibration: {vibration_type}, conf={vibration_confidence:.2f}")
+            return None
+        
+        # Get the current timestamp
+        timestamp = time.time()
+        
+        # Check if we should throttle this event
+        if not self._check_rate_limit(camera_name, "motion", timestamp):
+            return None
+            
+        # Start with the confidence from the motion detector
+        # These are directly mapped from CONFIDENCE_NONE (0) to CONFIDENCE_HIGH (3)
+        confidence = motion_confidence
+        
+        # Further adjust confidence based on our analysis
+        # Upgrade confidence for high human confidence detections
+        if likely_human and human_confidence > 0.8:
+            confidence = max(confidence, self.CONFIDENCE_HIGH)
+        elif likely_human and human_confidence > 0.6:
+            confidence = max(confidence, self.CONFIDENCE_MEDIUM)
+        
+        # Downgrade confidence for vibrations that weren't rejected
+        if is_vibration and vibration_confidence > 0.4:
+            confidence = max(self.CONFIDENCE_NONE, confidence - 1)
+        
+        # Determine event type based on intensity and patterns
+        if intensity > self.motion_intensity_threshold * 1.5 and likely_human:
+            event_type = "human_activity"
+        elif intensity > self.motion_intensity_threshold:
+            event_type = "significant_motion"
+        else:
+            event_type = "minor_motion"
+            
+        # Prepare the enhanced event data with all vibration analysis information
+        event_data = {
+            "camera_name": camera_name,
+            "timestamp": timestamp,
+            "event_type": event_type,
+            "confidence": confidence,
+            "intensity": intensity,
+            "duration": motion_data.get("duration", 0),
+            "is_vibration": is_vibration,
+            "vibration_confidence": vibration_confidence,
+            "vibration_type": vibration_type,
+            "likely_human": likely_human,
+            "human_confidence": human_confidence,
+            "bounding_boxes": motion_data.get("bounding_boxes", []),
+            "van_id": self.van_id  # Include van_id in event data
+        }
+        
+        return event_data
+    
     def _calculate_confidence(self, category: str, event_type: str, 
                             detection_data: Dict[str, Any]) -> int:
         """
@@ -464,22 +547,26 @@ class EnhancedEventClassifier:
             # Get motion intensity
             intensity = detection_data.get("intensity", 0)
             is_vibration = detection_data.get("is_vibration", False)
-            duration = detection_data.get("duration", 0)
+            vibration_confidence = detection_data.get("vibration_confidence", 0.0)
+            vibration_type = detection_data.get("vibration_type", "UNKNOWN")
+            likely_human = detection_data.get("likely_human", False)
+            human_confidence = detection_data.get("human_confidence", 0.0)
+            motion_confidence = detection_data.get("confidence", 0)
             
             # Vibrations are lower confidence
-            if is_vibration:
+            if is_vibration and vibration_confidence > 0.4:
                 confidence = self.CONFIDENCE_NONE
             else:
-                # Adjust confidence based on intensity and duration
+                # Adjust confidence based on intensity and human confidence
                 if intensity > 60:
                     confidence = self.CONFIDENCE_MEDIUM
                 if intensity > 80:
                     confidence = self.CONFIDENCE_HIGH
                     
-                if duration > 5.0:
+                if likely_human and human_confidence > 0.8:
+                    confidence = max(confidence, self.CONFIDENCE_HIGH)
+                elif likely_human and human_confidence > 0.6:
                     confidence = max(confidence, self.CONFIDENCE_MEDIUM)
-                if duration > 10.0:
-                    confidence = self.CONFIDENCE_HIGH
         
         elif category == self.CATEGORY_HUMAN:
             # Get human detection confidence

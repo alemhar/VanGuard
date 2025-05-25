@@ -11,11 +11,15 @@ Key features:
 - Minimum size filtering
 """
 
+import time
+import logging
 import cv2
 import numpy as np
-import time
 from typing import Dict, List, Tuple, Optional, Any
-import logging
+from datetime import datetime
+
+# Import the enhanced vibration analyzer
+from .vibration_analyzer import VibrationAnalyzer
 
 # Configure logging
 logging.basicConfig(
@@ -99,9 +103,19 @@ class MotionDetector:
         # Human detection parameters (configurable)
         self.human_detection_config = human_detection_config or {}
         self.human_detection_enabled = self.human_detection_config.get("enabled", True)
-        self.flow_magnitude_threshold = self.human_detection_config.get("flow_magnitude_threshold", 5.0)
-        self.flow_uniformity_threshold = self.human_detection_config.get("flow_uniformity_threshold", 0.6)
-        self.significant_motion_threshold = self.human_detection_config.get("significant_motion_threshold", 8.0)
+        
+        # Get the optimized flow thresholds from memory
+        self.flow_magnitude_threshold = self.human_detection_config.get("flow_magnitude_threshold", 3.5)
+        self.flow_uniformity_threshold = self.human_detection_config.get("flow_uniformity_threshold", 0.5)
+        self.significant_motion_threshold = self.human_detection_config.get("significant_motion_threshold", 6.0)
+        
+        # Initialize enhanced vibration analyzer for improved filtering
+        self.vibration_analyzer = VibrationAnalyzer(
+            window_size=20,             # 20 frames history (10 seconds at 2 FPS)
+            pattern_threshold=0.7,      # Threshold for vibration pattern detection
+            adaptive_learning=True      # Enable adaptive thresholds
+        )
+        
         self.human_min_duration = self.human_detection_config.get("min_duration", 2.0)
         
         # Track motion state
@@ -203,7 +217,7 @@ class MotionDetector:
     def _calculate_optical_flow(self, frame: np.ndarray) -> Dict[str, Any]:
         """
         Calculate optical flow to verify motion and filter camera shake/vibration.
-        Enhanced to detect human movement patterns vs. vibration.
+        Enhanced to detect human movement patterns vs. vibration using advanced pattern analysis.
         
         Args:
             frame: Current frame in grayscale
@@ -237,28 +251,38 @@ class MotionDetector:
             flow_uniformity = min(1.0, angle_std / np.pi)
         else:
             flow_uniformity = 0.0
-            
-        # Detect vibration pattern (high frequency small magnitude movements)
-        is_vibration = (flow_magnitude > 0.2 and flow_magnitude < 2.0 and flow_uniformity < 0.3)
         
-        # Detect human movement patterns using configurable thresholds
-        # Human movement typically has:  
-        # 1. Moderate to high magnitude (significant movement)
-        # 2. Higher flow uniformity value (less uniform direction across frame)
-        # 3. Distinct patterns different from vibrations (entering/exiting frame)
+        # Extract additional flow components for enhanced analysis
+        flow_components = self.vibration_analyzer.extract_flow_components(flow)
+        
+        # Use enhanced vibration analyzer for better pattern detection
+        # This analyzes temporal patterns across frames to detect repetitive movements
+        enhanced_detection = self.vibration_analyzer.detect_human_vs_vibration(
+            flow_magnitude, 
+            flow_uniformity,
+            flow_components
+        )
+        
+        # Get enhanced vibration detection results
+        is_vibration = enhanced_detection["is_vibration"]
+        vibration_confidence = enhanced_detection["vibration_confidence"]
+        vibration_type = enhanced_detection["vibration_type"]
+        likely_human = enhanced_detection["likely_human"]
+        human_confidence = enhanced_detection["human_confidence"]
+        
+        # If enhanced vibration detection is very confident, override the default detection
+        # but make sure human detection still takes precedence when strong evidence exists
         if not self.human_detection_enabled:
             likely_human = False
-        else:
-            # Entering/exiting the frame usually creates significant edge changes
-            # with moderate uniformity but high magnitude
-            likely_human = (
-                # Significant edge flow with moderate uniformity (entering/exiting frame)
-                (flow_magnitude > self.flow_magnitude_threshold * 0.7 and flow_uniformity > 0.4) or 
-                # Very significant motion, definitely human
-                (flow_magnitude > self.significant_motion_threshold * 0.8) or
-                # Unusual flow pattern different from vibration
-                (flow_uniformity > 0.7 and flow_magnitude > self.flow_magnitude_threshold * 0.5)
-            )
+        elif likely_human and human_confidence > 0.7:
+            # Strong human confidence overrides vibration detection
+            is_vibration = False
+        
+        # Log significant detections for debugging
+        if is_vibration and vibration_confidence > 0.8:
+            logger.debug(f"High confidence vibration: {vibration_type}, confidence={vibration_confidence:.2f}")
+        elif likely_human and human_confidence > 0.8:
+            logger.debug(f"High confidence human movement, confidence={human_confidence:.2f}")
         
         # Update previous frame
         self.prev_gray = frame.copy()
@@ -267,7 +291,11 @@ class MotionDetector:
             "magnitude": flow_magnitude,
             "uniformity": flow_uniformity,
             "is_vibration": is_vibration,
-            "likely_human": likely_human
+            "likely_human": likely_human,
+            "vibration_confidence": vibration_confidence,
+            "vibration_type": vibration_type,
+            "human_confidence": human_confidence,
+            "flow_components": flow_components
         }
     
     def detect(self, frame: np.ndarray) -> Dict[str, Any]:
@@ -296,12 +324,15 @@ class MotionDetector:
         # Convert to grayscale for optical flow
         gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
         
-        # Calculate optical flow for motion verification
+        # Calculate optical flow for motion verification with enhanced vibration detection
         flow_data = self._calculate_optical_flow(gray)
         flow_magnitude = flow_data["magnitude"]
         flow_uniformity = flow_data["uniformity"]
         is_vibration = flow_data["is_vibration"]
-        likely_human = flow_data.get("likely_human", False)  # New human detection feature
+        vibration_confidence = flow_data.get("vibration_confidence", 0.0)
+        vibration_type = flow_data.get("vibration_type", "UNKNOWN")
+        likely_human = flow_data.get("likely_human", False)
+        human_confidence = flow_data.get("human_confidence", 0.0)
         
         # Apply Gaussian blur to reduce noise
         if self.blur_size > 0:
@@ -374,9 +405,22 @@ class MotionDetector:
         # Area percentage is most important, then contours, then flow
         raw_intensity = (area_percentage * 0.5) + (contour_factor * 30) + (flow_factor * 20)
         
-        # Reduce intensity for vibration patterns
+        # Enhanced vibration filtering based on pattern analysis
         if is_vibration:
-            raw_intensity *= 0.3  # Significantly reduce intensity for vibration
+            # More aggressive reduction for repetitive movements
+            if vibration_type == "REPETITIVE_MOVEMENT":
+                raw_intensity *= 0.1  # 90% reduction for repetitive movements
+            # Significant reduction for high-frequency vehicle vibrations
+            elif vibration_type == "HIGH_FREQ_VEHICLE":
+                raw_intensity *= 0.2  # 80% reduction for vehicle vibrations
+            # Standard reduction for general vibrations
+            else:
+                raw_intensity *= 0.3  # 70% reduction for general vibrations
+                
+            # Apply confidence-based scaling
+            # Higher vibration confidence = more reduction
+            confidence_factor = max(0.1, 1.0 - vibration_confidence)
+            raw_intensity *= confidence_factor
             
         intensity = int(min(100, raw_intensity))
         
@@ -409,33 +453,40 @@ class MotionDetector:
         if len(self.motion_history) > 10:  # Keep last 10 frames
             self.motion_history.pop(0)
             
-        # Calculate detection confidence
+        # Determine confidence level with enhanced human vs. vibration detection
         confidence = self.CONFIDENCE_NONE
+        
         if stable_motion:
-            # Calculate confidence level (0-3)
+            # Start with low confidence
+            confidence = self.CONFIDENCE_LOW
+            
+            # Enhanced vibration filtering
             if is_vibration and not likely_human:
-                confidence = self.CONFIDENCE_NONE  # No confidence if this is just vibration
-            elif likely_human and stable_motion:
-                # Boost confidence for likely human movement
-                if intensity > 50:
+                # Complete rejection of vibrations with high confidence
+                if vibration_confidence > 0.7:
+                    confidence = self.CONFIDENCE_NONE
+                # Downgrade confidence for medium confidence vibrations
+                elif vibration_confidence > 0.4:
+                    confidence = max(self.CONFIDENCE_NONE, confidence - 1)
+            
+            # Enhanced human detection
+            if likely_human:
+                # Boost confidence based on human detection confidence
+                if human_confidence > 0.7:
+                    confidence = max(confidence + 1, self.CONFIDENCE_MEDIUM)
+                if human_confidence > 0.9:
                     confidence = self.CONFIDENCE_HIGH
-                else:
-                    confidence = self.CONFIDENCE_MEDIUM
-            elif stable_motion and intensity > 60:
+            
+            # Increase confidence if motion has high intensity and duration
+            if intensity > 40 and self.motion_duration >= 1.0:
+                confidence = max(confidence, self.CONFIDENCE_MEDIUM)
+                
+            # Highest confidence if sustained high intensity motion
+            if intensity > 70 and self.motion_duration >= 2.0:
                 confidence = self.CONFIDENCE_HIGH
-            elif stable_motion and intensity > 40:
-                confidence = self.CONFIDENCE_MEDIUM
-            elif stable_motion:
-                confidence = self.CONFIDENCE_LOW
-            else:
-                confidence = self.CONFIDENCE_NONE
-        
-        # Determine final motion detection status
-        motion_detected = stable_motion
-        
         # Update duration tracking
         current_time = time.time()
-        if motion_detected:
+        if stable_motion:
             if not self.is_motion_active:
                 # Motion just started
                 self.is_motion_active = True
@@ -451,7 +502,8 @@ class MotionDetector:
         
         # Return enhanced detection results with vibration information
         return {
-            "motion_detected": motion_detected and (not is_vibration or likely_human),
+            # Reject motion if it's high-confidence vibration and not likely human
+            "motion_detected": stable_motion and (not (is_vibration and vibration_confidence > 0.7) or likely_human),
             "bounding_boxes": boxes,
             "intensity": intensity,
             "duration": round(self.motion_duration, 1),
@@ -462,58 +514,77 @@ class MotionDetector:
             "flow_magnitude": flow_magnitude,
             "flow_uniformity": flow_uniformity,
             "is_vibration": is_vibration and not likely_human,  # Override vibration if human movement is detected
-            "likely_human": likely_human
+            "vibration_confidence": vibration_confidence,
+            "vibration_type": vibration_type,
+            "likely_human": likely_human,
+            "human_confidence": human_confidence
         }
     
     def visualize(self, frame: np.ndarray, detection_result: Dict[str, Any], show_text: bool = True) -> np.ndarray:
         """
-        Visualize motion detection results on the frame.
+        Visualize the detection result by drawing bounding boxes and text information.
+        Enhanced with vibration analysis visualization.
         
         Args:
-            frame: Original video frame
-            detection_result: Result from detect() method
-            show_text: Whether to show text overlays (set to False when used in integrated detector)
+            frame: Original frame
+            detection_result: Result from detect method
+            show_text: Whether to show text information
             
         Returns:
-            Frame with visualization overlays
+            Visualized frame with detection information
         """
         output_frame = frame.copy()
         
-        # Draw ROI areas with thinner lines when used in integrated detector
-        line_thickness = 1 if not show_text else 2
+        # Draw bounding boxes
+        if detection_result["motion_detected"]:
+            for box in detection_result["bounding_boxes"]:
+                x, y, w, h = box
+                cv2.rectangle(output_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
         
-        for x, y, w, h in self.roi_areas:
-            cv2.rectangle(output_frame, (x, y), (x+w, y+h), (0, 255, 0), line_thickness)
-        
-        # Draw motion bounding boxes with confidence-based colors
-        confidence = detection_result.get("confidence", 0)
-        for x, y, w, h in detection_result.get("bounding_boxes", []):
-            # Color based on confidence level (red=high, orange=medium, yellow=low)
-            if confidence == self.CONFIDENCE_HIGH:
-                color = (0, 0, 255)  # Red
-            elif confidence == self.CONFIDENCE_MEDIUM:
-                color = (0, 140, 255)  # Orange
-            else:
-                color = (0, 255, 255)  # Yellow
-                
-            cv2.rectangle(output_frame, (x, y), (x+w, y+h), color, line_thickness)
-        
-        # Add text information only if show_text is True
+        # Add text information
         if show_text:
-            info_text = [
-                f"Motion: {'Yes' if detection_result.get('motion_detected', False) else 'No'}",
-                f"Intensity: {detection_result.get('intensity', 0)}",
-                f"Duration: {detection_result.get('duration', 0)}s",
-                f"Confidence: {detection_result.get('confidence', 0)}",
-                f"{'Night' if detection_result.get('is_night_time', False) else 'Day'} Mode"
-            ]
+            motion_text = "Motion: Yes" if detection_result["motion_detected"] else "Motion: No"
+            intensity_text = f"Intensity: {detection_result['intensity']}"
             
-            for i, text in enumerate(info_text):
-                cv2.putText(
-                    output_frame, text, (10, 30 + i*30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
-                )
-        
+            # Enhanced vibration display
+            if detection_result.get("is_vibration", False):
+                vib_conf = detection_result.get("vibration_confidence", 0.0)
+                vib_type = detection_result.get("vibration_type", "UNKNOWN")
+                vibration_text = f"Type: {vib_type} ({vib_conf:.2f})"
+                vibration_color = (0, 0, 255)  # Red for vibration
+            else:
+                vibration_text = "Type: Normal"
+                vibration_color = (0, 255, 0)  # Green for normal
+            
+            # Enhanced human detection display
+            if detection_result.get("likely_human", False):
+                human_conf = detection_result.get("human_confidence", 0.0)
+                human_text = f"Human: Likely ({human_conf:.2f})"
+                human_color = (255, 128, 0)  # Orange for human
+            else:
+                human_text = "Human: No"
+                human_color = (0, 255, 0)  # Green
+            
+            # Add confidence level
+            confidence_level = detection_result.get("confidence", 0)
+            confidence_names = ["None", "Low", "Medium", "High"]
+            confidence_text = f"Confidence: {confidence_names[confidence_level]}"
+            
+            y_pos = 30
+            cv2.putText(output_frame, motion_text, (10, y_pos), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            y_pos += 30
+            cv2.putText(output_frame, intensity_text, (10, y_pos), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            y_pos += 30
+            cv2.putText(output_frame, vibration_text, (10, y_pos), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, vibration_color, 2)
+            y_pos += 30
+            cv2.putText(output_frame, human_text, (10, y_pos), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, human_color, 2)
+            y_pos += 30
+            cv2.putText(output_frame, confidence_text, (10, y_pos), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         return output_frame
 
 # Example usage
