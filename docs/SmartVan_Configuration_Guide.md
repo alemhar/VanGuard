@@ -39,6 +39,23 @@ These settings have been optimized for detecting human presence (inventory acces
 }
 ```
 
+### Object Detection Parameters
+
+```json
+"object_detection": {
+    "enabled": true,
+    "model_size": "tiny",
+    "confidence_threshold": 0.5,
+    "nms_threshold": 0.4,
+    "only_on_motion": true,
+    "gpu_enabled": false,
+    "yolo_interval": 5,
+    "human_confirmation_needed": true,
+    "object_recording_threshold": 0.6,
+    "classes_of_interest": ["person", "backpack", "handbag", "suitcase", "bottle"]
+}
+```
+
 ### Camera Settings
 
 ```json
@@ -90,6 +107,21 @@ These settings have been optimized for detecting human presence (inventory acces
 | `event_memory_window` | How long to remember events (seconds) | `3600` |
 | `min_alert_interval` | Minimum seconds between alerts for same camera | `120` |
 | `motion_intensity_threshold` | Minimum intensity to be considered significant | `40` |
+
+### Object Detection
+
+| Parameter | Description | Recommended Value |
+|-----------|-------------|------------------|
+| `enabled` | Whether YOLO object detection is enabled | `true` |
+| `model_size` | Size of YOLO model (tiny, medium, large) | `"tiny"` |
+| `confidence_threshold` | Minimum confidence for object detection | `0.5` |
+| `nms_threshold` | Non-maximum suppression threshold | `0.4` |
+| `only_on_motion` | Only run YOLO when motion is detected | `true` |
+| `gpu_enabled` | Use GPU acceleration if available | `false` |
+| `yolo_interval` | Run YOLO every X frames when no motion | `5` |
+| `human_confirmation_needed` | Require both motion and YOLO to confirm human | `true` |
+| `object_recording_threshold` | Confidence threshold to trigger recording | `0.6` |
+| `classes_of_interest` | COCO classes to detect | `["person", "backpack", "handbag", "suitcase", "bottle"]` |
 
 ### Camera Settings
 
@@ -159,6 +191,18 @@ These settings have been optimized for detecting human presence (inventory acces
         "event_memory_window": 3600,
         "min_alert_interval": 120,
         "motion_intensity_threshold": 40
+    },
+    "object_detection": {
+        "enabled": true,
+        "model_size": "tiny",
+        "confidence_threshold": 0.5,
+        "nms_threshold": 0.4,
+        "only_on_motion": true,
+        "gpu_enabled": false,
+        "yolo_interval": 5,
+        "human_confirmation_needed": true,
+        "object_recording_threshold": 0.6,
+        "classes_of_interest": ["person", "backpack", "handbag", "suitcase", "bottle"]
     },
     "recording": {
         "min_intensity": 20,
