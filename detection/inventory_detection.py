@@ -45,7 +45,8 @@ class InventoryChangeDetector:
                 output_dir: str = "output",
                 change_threshold: float = 0.15,   # Percentage change required for detection
                 min_change_area: int = 200,       # Minimum size of change area in pixels
-                state_memory_window: int = 3600): # How long to remember inventory states (seconds)
+                state_memory_window: int = 3600,  # How long to remember inventory states (seconds)
+                config: Dict[str, Any] = None):   # Configuration dictionary
         """
         Initialize the inventory change detector.
         
@@ -54,6 +55,7 @@ class InventoryChangeDetector:
             change_threshold: Threshold for significant pixel changes (0.0-1.0)
             min_change_area: Minimum contour area to consider as meaningful change
             state_memory_window: How long to keep inventory states in memory (seconds)
+            config: Optional configuration dictionary with zone-specific settings
         """
         self.output_dir = Path(output_dir)
         self.inventory_states_dir = self.output_dir / "inventory_states"
@@ -62,6 +64,9 @@ class InventoryChangeDetector:
         self.change_threshold = change_threshold
         self.min_change_area = min_change_area
         self.state_memory_window = state_memory_window
+        
+        # Initialize configuration dictionary
+        self.config = config if config is not None else {}
         
         # Inventory state storage
         # camera_name -> zone_id -> {"image": image, "timestamp": timestamp}
@@ -321,6 +326,7 @@ class InventoryChangeDetector:
                                  duration: float, camera_name: str, zone_id: str) -> Dict[str, Any]:
         """
         Analyze changes between before and after images of inventory zone.
+        Implements lighting-invariant detection and improved item classification.
         
         Args:
             before_image: Image of zone before access
@@ -336,16 +342,32 @@ class InventoryChangeDetector:
         if before_image.shape != after_image.shape:
             logger.warning("Before/after images have different dimensions - resizing")
             after_image = cv2.resize(after_image, (before_image.shape[1], before_image.shape[0]))
+            
+        # Get zone-specific settings if available
+        zone_config = self.config.get("zones", {}).get(zone_id, {})
+        zone_threshold = zone_config.get("change_threshold", self.change_threshold)
+        zone_min_area = zone_config.get("min_change_area", self.min_change_area)
         
-        # Convert to grayscale for analysis
-        before_gray = cv2.cvtColor(before_image, cv2.COLOR_BGR2GRAY)
-        after_gray = cv2.cvtColor(after_image, cv2.COLOR_BGR2GRAY)
+        # Apply lighting normalization techniques
+        normalized_before, normalized_after = self._normalize_lighting(before_image, after_image)
         
-        # Calculate absolute difference
-        diff = cv2.absdiff(before_gray, after_gray)
+        # Compute differences using multiple color spaces for robustness
+        diff_hsv = self._compute_hsv_difference(normalized_before, normalized_after)
+        diff_lab = self._compute_lab_difference(normalized_before, normalized_after)
+        diff_gray = self._compute_gray_difference(normalized_before, normalized_after)
         
-        # Apply threshold to highlight significant changes
-        _, thresholded = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+        # Combine differences using weighted approach
+        combined_diff = self._combine_differences(diff_hsv, diff_lab, diff_gray)
+        
+        # Apply adaptive thresholding based on local contrast
+        thresholded = cv2.adaptiveThreshold(
+            combined_diff,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11,  # Block size
+            2    # Constant subtracted from mean
+        )
         
         # Apply morphological operations to reduce noise
         kernel = np.ones((5, 5), np.uint8)
@@ -355,42 +377,38 @@ class InventoryChangeDetector:
         # Find contours of changed regions
         contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Filter contours by size
-        significant_contours = [c for c in contours if cv2.contourArea(c) > self.min_change_area]
+        # Filter contours by size (using zone-specific settings)
+        significant_contours = [c for c in contours if cv2.contourArea(c) > zone_min_area]
         
         # Calculate percentage of changed pixels
-        total_pixels = before_gray.size
+        total_pixels = combined_diff.size
         changed_pixels = np.count_nonzero(thresholded)
         change_percentage = changed_pixels / total_pixels
         
         # Create visualization of differences
         diff_visualization = after_image.copy()
         
-        # Identify if change is significant
-        change_detected = change_percentage > self.change_threshold and len(significant_contours) > 0
+        # Identify if change is significant (using zone-specific threshold)
+        change_detected = change_percentage > zone_threshold and len(significant_contours) > 0
         
         # Determine event type and confidence
         if not change_detected:
             event_type = self.EVENT_NO_CHANGE
             confidence = self.CONFIDENCE_LOW
         else:
-            # Calculate mean brightness in before and after images
-            before_brightness = np.mean(before_gray)
-            after_brightness = np.mean(after_gray)
-            
-            # If after is darker than before, likely an item was removed
-            if after_brightness > before_brightness:
-                event_type = self.EVENT_ITEM_REMOVAL
-            else:
-                event_type = self.EVENT_ITEM_ADDITION
+            # Advanced item classification using color and texture features
+            event_type, item_confidence = self._classify_inventory_change(
+                normalized_before, normalized_after, significant_contours
+            )
                 
-            # Draw contours on visualization
-            cv2.drawContours(diff_visualization, significant_contours, -1, (0, 0, 255), 2)
+            # Draw contours on visualization with color based on event type
+            color = (0, 0, 255) if event_type == self.EVENT_ITEM_ADDITION else (255, 0, 0)
+            cv2.drawContours(diff_visualization, significant_contours, -1, color, 2)
             
-            # Set confidence based on change percentage and duration
-            if change_percentage > 0.3:
+            # Set confidence based on multiple factors
+            if change_percentage > 0.3 and item_confidence > 0.7:
                 confidence = self.CONFIDENCE_HIGH
-            elif change_percentage > 0.2:
+            elif change_percentage > 0.2 and item_confidence > 0.5:
                 confidence = self.CONFIDENCE_MEDIUM
             else:
                 confidence = self.CONFIDENCE_LOW
@@ -399,7 +417,7 @@ class InventoryChangeDetector:
             if duration > 5.0 and confidence < self.CONFIDENCE_HIGH:
                 confidence += 1
         
-        # Prepare result
+        # Prepare enhanced result with more detailed metrics
         result = {
             "event_type": event_type,
             "change_detected": change_detected,
@@ -409,14 +427,309 @@ class InventoryChangeDetector:
             "total_pixels": total_pixels,
             "contour_count": len(significant_contours),
             "diff_image": diff_visualization if change_detected else None,
+            "zone_id": zone_id,
+            "camera_name": camera_name,
             "analysis": {
                 "significant_contours": len(significant_contours),
-                "change_threshold": self.change_threshold,
-                "min_change_area": self.min_change_area
+                "change_threshold": zone_threshold,  # Zone-specific threshold
+                "min_change_area": zone_min_area,    # Zone-specific area
+                "lighting_difference": self._calculate_lighting_difference(before_image, after_image),
+                "normalized_change_score": self._calculate_normalized_change_score(change_percentage, len(significant_contours))
             }
         }
         
         return result
+    
+    def _normalize_lighting(self, before_image: np.ndarray, after_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply lighting normalization to make change detection robust to lighting variations.
+        
+        Args:
+            before_image: Image before inventory access
+            after_image: Image after inventory access
+            
+        Returns:
+            Tuple of normalized before and after images
+        """
+        # Convert to LAB color space which separates luminance from color
+        before_lab = cv2.cvtColor(before_image, cv2.COLOR_BGR2LAB)
+        after_lab = cv2.cvtColor(after_image, cv2.COLOR_BGR2LAB)
+        
+        # Split channels
+        before_l, before_a, before_b = cv2.split(before_lab)
+        after_l, after_a, after_b = cv2.split(after_lab)
+        
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to luminance channel
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        before_l_eq = clahe.apply(before_l)
+        after_l_eq = clahe.apply(after_l)
+        
+        # Merge channels back
+        before_lab_eq = cv2.merge([before_l_eq, before_a, before_b])
+        after_lab_eq = cv2.merge([after_l_eq, after_a, after_b])
+        
+        # Convert back to BGR
+        before_normalized = cv2.cvtColor(before_lab_eq, cv2.COLOR_LAB2BGR)
+        after_normalized = cv2.cvtColor(after_lab_eq, cv2.COLOR_LAB2BGR)
+        
+        return before_normalized, after_normalized
+    
+    def _compute_hsv_difference(self, img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
+        """
+        Compute difference in HSV color space, which is more robust to lighting changes.
+        
+        Args:
+            img1: First image
+            img2: Second image
+            
+        Returns:
+            Difference image (grayscale)
+        """
+        # Convert to HSV
+        hsv1 = cv2.cvtColor(img1, cv2.COLOR_BGR2HSV)
+        hsv2 = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)
+        
+        # Split channels
+        h1, s1, v1 = cv2.split(hsv1)
+        h2, s2, v2 = cv2.split(hsv2)
+        
+        # Calculate differences (with circular handling for hue)
+        h_diff = cv2.absdiff(h1, h2)
+        h_diff = np.minimum(h_diff, 180 - h_diff)
+        s_diff = cv2.absdiff(s1, s2)
+        
+        # Normalize and combine (ignore value channel which is most affected by lighting)
+        h_diff = (h_diff / 90.0) * 255  # Hue difference (max 180) normalized
+        s_diff = s_diff.astype(np.float32)
+        
+        # Weight hue more than saturation for color changes
+        combined = (0.7 * h_diff + 0.3 * s_diff).astype(np.uint8)
+        
+        return combined
+    
+    def _compute_lab_difference(self, img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
+        """
+        Compute difference in LAB color space, focusing on the color channels (a,b).
+        
+        Args:
+            img1: First image
+            img2: Second image
+            
+        Returns:
+            Difference image (grayscale)
+        """
+        # Convert to LAB
+        lab1 = cv2.cvtColor(img1, cv2.COLOR_BGR2LAB)
+        lab2 = cv2.cvtColor(img2, cv2.COLOR_BGR2LAB)
+        
+        # Split channels
+        _, a1, b1 = cv2.split(lab1)
+        _, a2, b2 = cv2.split(lab2)
+        
+        # Calculate differences in a and b channels
+        a_diff = cv2.absdiff(a1, a2)
+        b_diff = cv2.absdiff(b1, b2)
+        
+        # Combine a and b differences
+        combined = cv2.addWeighted(a_diff, 0.5, b_diff, 0.5, 0)
+        
+        return combined
+    
+    def _compute_gray_difference(self, img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
+        """
+        Compute difference in grayscale with local contrast normalization.
+        
+        Args:
+            img1: First image
+            img2: Second image
+            
+        Returns:
+            Difference image (grayscale)
+        """
+        # Convert to grayscale
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur to reduce noise
+        gray1 = cv2.GaussianBlur(gray1, (5, 5), 0)
+        gray2 = cv2.GaussianBlur(gray2, (5, 5), 0)
+        
+        # Calculate absolute difference
+        diff = cv2.absdiff(gray1, gray2)
+        
+        return diff
+    
+    def _combine_differences(self, hsv_diff: np.ndarray, lab_diff: np.ndarray, gray_diff: np.ndarray) -> np.ndarray:
+        """
+        Combine differences from multiple color spaces for robust change detection.
+        
+        Args:
+            hsv_diff: Difference in HSV space
+            lab_diff: Difference in LAB space
+            gray_diff: Difference in grayscale
+            
+        Returns:
+            Combined difference image (grayscale)
+        """
+        # Ensure all differences are same size and type
+        hsv_diff = cv2.resize(hsv_diff, (gray_diff.shape[1], gray_diff.shape[0]))
+        lab_diff = cv2.resize(lab_diff, (gray_diff.shape[1], gray_diff.shape[0]))
+        
+        # Weighted combination (empirical weights that prioritize color differences)
+        combined = cv2.addWeighted(
+            hsv_diff, 0.4,
+            cv2.addWeighted(lab_diff, 0.4, gray_diff, 0.2, 0),
+            1.0, 0
+        )
+        
+        return combined
+    
+    def _classify_inventory_change(self, before_image: np.ndarray, after_image: np.ndarray, 
+                                  contours: List) -> Tuple[str, float]:
+        """
+        Classify inventory change as item addition or removal using advanced features.
+        
+        Args:
+            before_image: Normalized before image
+            after_image: Normalized after image
+            contours: List of significant contours
+            
+        Returns:
+            Tuple of (event_type, confidence)
+        """
+        # Convert to grayscale for basic analysis
+        before_gray = cv2.cvtColor(before_image, cv2.COLOR_BGR2GRAY)
+        after_gray = cv2.cvtColor(after_image, cv2.COLOR_BGR2GRAY)
+        
+        # Features to analyze
+        addition_score = 0.0
+        removal_score = 0.0
+        
+        # For each contour, analyze the region
+        for contour in contours:
+            # Create mask for this contour
+            mask = np.zeros(before_gray.shape, dtype=np.uint8)
+            cv2.drawContours(mask, [contour], 0, 255, -1)
+            
+            # Extract region stats for before and after
+            before_mean = cv2.mean(before_gray, mask=mask)[0]
+            after_mean = cv2.mean(after_gray, mask=mask)[0]
+            
+            # Calculate masked histograms for before and after
+            before_hist = cv2.calcHist([before_gray], [0], mask, [32], [0, 256])
+            after_hist = cv2.calcHist([after_gray], [0], mask, [32], [0, 256])
+            
+            # Normalize histograms
+            cv2.normalize(before_hist, before_hist, 0, 1, cv2.NORM_MINMAX)
+            cv2.normalize(after_hist, after_hist, 0, 1, cv2.NORM_MINMAX)
+            
+            # Calculate histogram difference
+            hist_diff = cv2.compareHist(before_hist, after_hist, cv2.HISTCMP_CORREL)
+            
+            # Analyze texture complexity (variance)
+            before_std = self._calculate_masked_std(before_gray, mask)
+            after_std = self._calculate_masked_std(after_gray, mask)
+            
+            # Object has appeared: after is more textured or darker than before
+            if after_std > before_std * 1.2 or after_mean < before_mean * 0.9:
+                addition_score += cv2.contourArea(contour) * (1 - hist_diff)
+            # Object has disappeared: before is more textured or darker than after
+            elif before_std > after_std * 1.2 or before_mean < after_mean * 0.9:
+                removal_score += cv2.contourArea(contour) * (1 - hist_diff)
+            # General brightness change without texture change likely means lighting change, not object change
+            elif abs(before_mean - after_mean) > 15 and abs(before_std - after_std) < 3:
+                # Likely a lighting change, reduce both scores
+                continue
+            else:
+                # Use brightness difference as a tiebreaker
+                if after_mean < before_mean:
+                    addition_score += cv2.contourArea(contour) * 0.5
+                else:
+                    removal_score += cv2.contourArea(contour) * 0.5
+        
+        # Determine final classification
+        total_area = sum(cv2.contourArea(c) for c in contours)
+        if total_area == 0:
+            return self.EVENT_NO_CHANGE, 0.5
+        
+        # Normalize scores
+        addition_score /= total_area
+        removal_score /= total_area
+        
+        # Calculate confidence based on score difference
+        confidence = abs(addition_score - removal_score) / max(addition_score + removal_score, 0.001)
+        
+        # Make final decision
+        if addition_score > removal_score:
+            return self.EVENT_ITEM_ADDITION, confidence
+        else:
+            return self.EVENT_ITEM_REMOVAL, confidence
+    
+    def _calculate_masked_std(self, image: np.ndarray, mask: np.ndarray) -> float:
+        """
+        Calculate standard deviation within a masked region.
+        
+        Args:
+            image: Input image
+            mask: Binary mask
+            
+        Returns:
+            Standard deviation within the mask
+        """
+        # Get pixels within mask
+        pixels = image[mask > 0]
+        if len(pixels) > 0:
+            return np.std(pixels)
+        return 0.0
+    
+    def _calculate_lighting_difference(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """
+        Calculate a metric for overall lighting difference between two images.
+        
+        Args:
+            img1: First image
+            img2: Second image
+            
+        Returns:
+            Lighting difference score (0-1)
+        """
+        # Convert to grayscale
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate mean and std of each image
+        mean1, std1 = cv2.meanStdDev(gray1)
+        mean2, std2 = cv2.meanStdDev(gray2)
+        
+        # Calculate difference in means (lighting level)
+        mean_diff = abs(mean1[0][0] - mean2[0][0]) / 255.0
+        
+        # Calculate difference in standard deviations (contrast)
+        std_diff = abs(std1[0][0] - std2[0][0]) / (max(std1[0][0], std2[0][0]) + 1e-5)
+        
+        # Combine (more weight to mean difference)
+        lighting_diff = 0.7 * mean_diff + 0.3 * std_diff
+        
+        return min(lighting_diff, 1.0)  # Clamp to 0-1 range
+    
+    def _calculate_normalized_change_score(self, change_percentage: float, contour_count: int) -> float:
+        """
+        Calculate a normalized change score that accounts for both area and contour count.
+        
+        Args:
+            change_percentage: Percentage of changed pixels
+            contour_count: Number of significant contours
+            
+        Returns:
+            Normalized change score (0-1)
+        """
+        # Normalize contour count (empirical max of 20 contours)
+        norm_contours = min(contour_count / 20.0, 1.0)
+        
+        # Combine (more weight to changed area)
+        score = 0.7 * change_percentage + 0.3 * norm_contours
+        
+        return score
     
     def _categorize_change_pattern(self, before_image: np.ndarray, after_image: np.ndarray) -> str:
         """

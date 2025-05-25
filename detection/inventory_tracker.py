@@ -65,12 +65,26 @@ class InventoryTracker:
         output_dir = self.config.get("output_dir", "output")
         change_threshold = self.config.get("change_threshold", 0.08)
         min_change_area = self.config.get("min_change_area", 200)
+        state_memory_window = self.config.get("state_memory_window", 3600)
+        
+        # Extract zone-specific configuration
+        zones_config = self.config.get("zones", {})
+        
+        # Create a proper config dictionary for the inventory change detector
+        change_detector_config = {
+            "system": {
+                "van_id": self.van_id
+            },
+            "zones": zones_config
+        }
         
         # Initialize with the correct parameters
         self.change_detector = InventoryChangeDetector(
             output_dir=output_dir,
             change_threshold=change_threshold,
-            min_change_area=min_change_area
+            min_change_area=min_change_area,
+            state_memory_window=state_memory_window,
+            config=change_detector_config
         )
         
         logger.info("Inventory tracker initialized")
