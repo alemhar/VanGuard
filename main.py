@@ -23,6 +23,10 @@ from detection.motion_detection import MotionDetector
 from detection.event_classification import EventClassifier
 from detection.object_detection.yolo_detector import YOLODetector
 from detection.integrated_detector import IntegratedDetector
+from detection.enhanced_monitor import EnhancedDetectionMonitor
+from detection.inventory_detection import InventoryChangeDetector
+from detection.inventory_tracker import InventoryTracker
+from detection.event_framework import EnhancedEventClassifier
 
 # Configure logging
 logging.basicConfig(
@@ -62,24 +66,45 @@ class SmartVanMonitor:
         self.camera_manager = CameraManager()
         self._setup_cameras()
         
-        # Initialize detection systems (one per camera)
+        # Initialize enhanced detection monitor (replaces individual detectors)
+        try:
+            logger.info("Initializing EnhancedDetectionMonitor with optimized parameters...")
+            # Add vibration detection settings to config if not already present
+            if "motion_detection" not in self.config:
+                self.config["motion_detection"] = {}
+            if "event_classification" not in self.config:
+                self.config["event_classification"] = {}
+                
+            # Make sure the fine-tuned thresholds are set
+            self.config["event_classification"]["motion_intensity_threshold"] = 40  # Ignore vibrations below 40
+            self.config["motion_detection"]["vibration_threshold"] = 40  # Configurable from command line
+                
+            # Initialize enhanced monitor with updated config
+            self.enhanced_monitor = EnhancedDetectionMonitor(self.config)
+            logger.info("Successfully initialized EnhancedDetectionMonitor")
+        except Exception as e:
+            logger.error(f"Error initializing EnhancedDetectionMonitor: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
+        
+        # Keep references to individual components for backward compatibility
         self.motion_detectors = {}
         self.integrated_detectors = {}
-        self._setup_motion_detectors()
-        self._setup_integrated_detectors()
+        self.event_classifier = None
         
-        # Initialize event classifier with configurable parameters
-        event_config = self.config.get("event_classification", {})
-        self.event_classifier = EventClassifier(
-            business_hours_start=event_config.get("business_hours_start", 7),
-            business_hours_end=event_config.get("business_hours_end", 19),
-            high_frequency_threshold=event_config.get("high_frequency_threshold", 5),
-            high_frequency_window=event_config.get("high_frequency_window", 900),
-            event_memory_window=event_config.get("event_memory_window", 3600)
-        )
-        
-        # Set additional configurable parameters
-        self.event_classifier.min_alert_interval = event_config.get("min_alert_interval", 120)
+        # Initialize cameras in the enhanced monitor
+        # Handle cameras list format from the existing config
+        for camera_config in self.config.get("cameras", []):
+            # Get camera name or use ID if name not available
+            camera_name = camera_config.get("name", f"Camera_{camera_config.get('id', 0)}")
+            
+            # Setup camera with ROI if available
+            if "roi" in camera_config:
+                roi_areas = camera_config["roi"]
+                self.enhanced_monitor.setup_camera(camera_name, roi_areas)
+            else:
+                self.enhanced_monitor.setup_camera(camera_name)
         
         logger.info("SmartVan Monitor initialized")
     
@@ -296,7 +321,17 @@ class SmartVanMonitor:
         
         # Settings from configuration
         display = self.config.get("display", True)
-        object_detection_enabled = self.config.get("object_detection", {}).get("enabled", True)
+        
+        # Use the fine-tuned FPS settings from your optimization work
+        # Get from first camera or use the default of 2 FPS for optimal detection
+        cameras_config = self.config.get("cameras", [])
+        fps_target = 2  # Default to 2 FPS (500ms intervals) as per your optimized settings
+        
+        if cameras_config and isinstance(cameras_config, list) and len(cameras_config) > 0:
+            fps_target = cameras_config[0].get("fps", fps_target)
+            
+        frame_interval_ms = max(1, int(1000 / fps_target))
+        logger.info(f"Using frame interval of {frame_interval_ms}ms ({fps_target} FPS) for optimal detection")
         
         # FPS tracking
         frame_count = 0
@@ -312,45 +347,43 @@ class SmartVanMonitor:
                 # Process each camera
                 for camera_name, (frame, timestamp, fps) in frames.items():
                     if frame is None:
+                        logger.warning(f"No frame received from {camera_name}")
                         continue
                     
-                    # Use integrated detector if enabled, otherwise fall back to motion-only
-                    if object_detection_enabled and camera_name in self.integrated_detectors:
-                        # Perform integrated detection (motion + YOLO)
-                        integrated_detector = self.integrated_detectors[camera_name]
-                        detection_result = integrated_detector.detect(frame, timestamp)
+                    try:
+                        # Process frame with enhanced detection monitor
+                        detection_result = self.enhanced_monitor.process_frame(camera_name, frame, timestamp)
                         
-                        # Process detection results if motion or human detected
-                        if detection_result["motion_detected"] or detection_result["human_detected"]:
-                            self._process_detection(camera_name, frame, detection_result, timestamp)
+                        # Determine if we should record this event
+                        should_record = self.enhanced_monitor.should_record(detection_result)
+                        detection_result["should_record"] = should_record
+                    except Exception as e:
+                        logger.error(f"Error processing frame from {camera_name}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        continue
+                    
+                    # Handle recording if needed
+                    if should_record:
+                        # Start a new recording
+                        self._save_event(camera_name, frame, detection_result, timestamp)
+                        self.recording_active[camera_name] = True
+                        self.last_save_time[camera_name] = timestamp
+                    elif camera_name in self.recording_active and self.recording_active[camera_name]:
+                        # Check if we need to end recording
+                        time_since_last = timestamp - self.last_save_time.get(camera_name, 0)
+                        min_recording_gap = self.config.get("recording", {}).get("min_recording_gap", 10)
                         
-                        # Display the frame with visualizations if enabled
-                        if display:
-                            # Visualize integrated detection results
-                            vis_frame = integrated_detector.visualize(frame, detection_result)
-                            
-                            # Display the frame
-                            cv2.imshow(f"SmartVan Monitor - {camera_name}", vis_frame)
-                    else:
-                        # Fall back to motion-only detection
-                        motion_detector = self.motion_detectors.get(camera_name)
-                        if motion_detector is None:
-                            continue
+                        if time_since_last > min_recording_gap:
+                            self.recording_active[camera_name] = False
+                    
+                    # Display frame with visualization
+                    if display:
+                        # Get enhanced visualization
+                        vis_frame = self.enhanced_monitor.visualize(camera_name, frame, detection_result)
                         
-                        # Detect motion
-                        motion_result = motion_detector.detect(frame)
-                        
-                        # Process motion detection results if motion detected
-                        if motion_result["motion_detected"]:
-                            self._process_detection(camera_name, frame, motion_result, timestamp)
-                        
-                        # Display the frame with visualizations if enabled
-                        if display:
-                            # Visualize motion detection
-                            vis_frame = motion_detector.visualize(frame, motion_result)
-                            
-                            # Display the frame
-                            cv2.imshow(f"SmartVan Monitor - {camera_name}", vis_frame)
+                        # Show frame
+                        cv2.imshow(f"SmartVan Monitor - {camera_name}", vis_frame)
                 
                 # FPS calculation and display
                 frame_count += 1
@@ -362,246 +395,157 @@ class SmartVanMonitor:
                     start_time = time.time()
                 
                 # Check for exit key (wait short time between frames)
-                if display and cv2.waitKey(10) & 0xFF == ord('q'):
+                key = cv2.waitKey(frame_interval_ms) & 0xFF
+                if key == 27 or key == ord('q'):  # ESC or 'q' to quit
                     break
                     
-            except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received, stopping")
-                break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-        
+                time.sleep(1)  # Prevent error flooding
+                
         # Clean up
-        if display:
-            cv2.destroyAllWindows()
+        for camera_name, camera in self.camera_manager.cameras.items():
+            if display:
+                cv2.destroyWindow(f"SmartVan Monitor - {camera_name}")
+        self.camera_manager.release_all()
     
-    def _process_detection(self, camera_name: str, frame: any, 
-                  detection_result: dict, timestamp: float) -> None:
+    def _save_event(self, camera_name: str, frame: np.ndarray, detection_result: Dict[str, Any], timestamp: float) -> None:
         """
-        Process detection results and classify events when motion or human is detected.
+        Save an event frame and metadata.
         
         Args:
             camera_name: Name of the camera
             frame: Current video frame
-            detection_result: Result from motion detector or integrated detector
+            detection_result: Result from enhanced detection monitor
             timestamp: Frame timestamp
         """
-        # Get recording and event classification configuration
+        # Get recording configuration
         recording_config = self.config.get("recording", {})
-        event_config = self.config.get("event_classification", {})
-        
-        # Use configurable minimum intensity thresholds
-        min_intensity = recording_config.get("min_intensity", 20)  # For recording
-        min_event_intensity = event_config.get("motion_intensity_threshold", 40)  # For classification
-        min_recording_gap = recording_config.get("min_recording_gap", 10)
-        
-        # Check if motion is significant enough for processing
-        # Determine if this is an integrated detection result
-        is_integrated = "human_detected" in detection_result
-        
-        # Get values with defaults to prevent KeyError exceptions
-        motion_detected = detection_result.get("motion_detected", False)
-        intensity = detection_result.get("intensity", 0)
-        confidence = detection_result.get("confidence", 0)
-        is_vibration = detection_result.get("is_vibration", False)
-        likely_human = detection_result.get("likely_human", False)
-        
-        # For integrated detection results, also check for human detection
-        if is_integrated:
-            human_detected = detection_result.get("human_detected", False)
-            # If human is detected via YOLO, mark as likely human for processing
-            if human_detected:
-                likely_human = True
-        
-        # Skip processing entirely for vibrations with low intensity
-        if is_vibration and intensity < min_event_intensity:
-            return
-            
-        # Skip processing for non-human movement below higher threshold
-        if not likely_human and intensity < min_event_intensity * 0.8:
-            return
-            
-        # More sophisticated evaluation of motion significance that excludes vibration
-        significant_motion = motion_detected and not is_vibration and (
-            # Either high intensity
-            intensity >= min_intensity or
-            # or high confidence with moderate intensity
-            (confidence >= 2 and intensity >= min_intensity * 0.7) or
-            # or likely human with any confidence
-            likely_human
-        )
-        
-        # If this is an integrated result, adjust intensity based on human detection
-        if is_integrated and detection_result.get("human_detected", False):
-            # Boost intensity for human detections
-            human_confidence = detection_result.get("human_confidence", 0)
-            intensity = max(intensity, int(human_confidence * 100))
-        
-        # Check if intensity exceeds threshold or human is detected with high confidence
-        min_intensity = self.config.get("recording", {}).get("min_intensity", 20)
-        object_recording_threshold = self.config.get("object_detection", {}).get("object_recording_threshold", 0.6)
-        
-        should_record = False
-        if intensity >= min_intensity:
-            should_record = True
-        elif is_integrated and detection_result.get("human_detected", False):
-            human_confidence = detection_result.get("human_confidence", 0)
-            if human_confidence >= object_recording_threshold:
-                should_record = True
-        
-        if should_record:
-            # Calculate time since last save for this camera
-            current_time = time.time()
-            last_save_time = self.last_save_time.get(camera_name, 0)
-            time_since_last_save = current_time - last_save_time
-            
-            # Enhanced result with additional details
-            enhanced_result = detection_result.copy()
-            
-            # Classify the event (with special handling for integrated detection)
-            if is_integrated:
-                # Use the motion_result part of the integrated detection for classification
-                motion_part = detection_result.get("motion_result", {})
-                
-                # Enhance with object detection information
-                motion_part["likely_human"] = detection_result.get("human_detected", False)
-                motion_part["human_confidence"] = detection_result.get("human_confidence", 0)
-                
-                # If YOLO detected a person, mark as likely human with high confidence
-                if detection_result.get("human_detected", False):
-                    motion_part["likely_human"] = True
-                    objects = detection_result.get("objects_detected", [])
-                    # Add detected objects to the motion result
-                    motion_part["detected_objects"] = objects
-                
-                classified_event = self.event_classifier.classify_event(
-                    camera_name, motion_part, timestamp
-                )
-            else:
-                # Regular motion-only classification
-                classified_event = self.event_classifier.classify_event(
-                    camera_name, detection_result, timestamp
-                )
-            
-            # Add classification data to enhanced result
-            enhanced_result["classification"] = {
-                "event_type": classified_event["event_type"],
-                "confidence": classified_event["confidence"],
-                "reasons": classified_event["reasons"]
-            }
-            
-            # Start a new recording
-            self._save_event(camera_name, frame, enhanced_result, timestamp)
-            self.recording_active[camera_name] = True
-            self.last_save_time[camera_name] = current_time
-            
-            # Skip logging if event was rate-limited
-            if classified_event.get('rate_limited', False):
-                return
-                
-            # Log with appropriate severity based on confidence and event type
-            if classified_event["confidence"] >= 3:
-                objects_str = ""
-                if is_integrated and detection_result.get("objects_detected", []):
-                    objects = [f"{obj['class']} ({obj['confidence']:.2f})" for obj in detection_result.get("objects_detected", [])]
-                    objects_str = f" - Objects: {', '.join(objects)}"
-                
-                logger.warning(f"Important event detected on {camera_name}: {classified_event['event_type']} - {', '.join(classified_event['reasons'])}{objects_str}")
-            elif classified_event["confidence"] > 0:  # Skip logging for zero-confidence events
-                logger.info(f"Event detected on {camera_name}: {classified_event['event_type']} - Intensity {intensity}")
-        else:
-            # No significant detection, mark as not recording
-            self.recording_active[camera_name] = False
-    
-    def _save_event(self, camera_name: str, frame: any, 
-                   detection_result: dict, timestamp: float) -> None:
-        """
-        Save a detection event (image and metadata).
-        
-        Args:
-            camera_name: Name of the camera
-            frame: Current video frame
-            detection_result: Result from motion detector or integrated detector
-            timestamp: Frame timestamp
-        """
-        # Determine if this is an integrated detection result
-        is_integrated = "human_detected" in detection_result
         
         # Create timestamp string
         dt = datetime.fromtimestamp(timestamp)
         timestamp_str = dt.strftime("%Y%m%d_%H%M%S")
         
-        # Add event type to filename if available
+        # Get event details from the detection result
+        motion_detected = detection_result.get("motion_detected", False)
+        motion_intensity = detection_result.get("intensity", 0)
+        motion_is_vibration = detection_result.get("is_vibration", False)
+        human_detected = detection_result.get("human_detected", False)
+        human_confidence = detection_result.get("human_confidence", 0)
+        
+        # Get inventory tracking data
+        inventory_tracking = detection_result.get("inventory_tracking", {})
+        inventory_access = inventory_tracking.get("inventory_access_detected", False)
+        inventory_change = inventory_tracking.get("inventory_change_detected", False)
+        
+        # Determine event type for filename
         event_type = "NORMAL"
-        if "classification" in detection_result:
-            event_type = detection_result["classification"]["event_type"]
+        if human_detected and human_confidence > 0.7:
+            event_type = "HUMAN_PRESENT"
+        elif inventory_change:
+            event_type = "INVENTORY_CHANGE"
+        elif inventory_access:
+            event_type = "INVENTORY_ACCESS"
+        elif motion_detected and not motion_is_vibration:
+            event_type = "MOTION"
         
-        # Add human detection info to filename if available
-        human_detected = detection_result.get("human_detected", False) if is_integrated else False
-        human_indicator = "_HUMAN" if human_detected else ""
+        # Build filename with descriptive information
+        filename_prefix = f"{camera_name}_{timestamp_str}_{event_type}"
+        if human_detected:
+            filename_prefix += f"_HUMAN{int(human_confidence*100)}"
+        if motion_detected:
+            filename_prefix += f"_MOTION{motion_intensity}"
+        if inventory_change:
+            change_type = inventory_tracking.get("change_type", "UNKNOWN")
+            filename_prefix += f"_{change_type}"
         
-        # Add intensity to filename
-        intensity = detection_result.get("intensity", 0)
-            
-        # Save image
-        image_filename = f"{camera_name}_{timestamp_str}_{event_type}{human_indicator}_intensity{intensity}.jpg"
-        image_path = os.path.join(self.output_dir, "clips", image_filename)
+        # Save the frame image
+        image_filename = f"{filename_prefix}.jpg"
+        image_path = str(self.clips_dir / image_filename)
         cv2.imwrite(image_path, frame)
         
-        # Save metadata with enhanced information
+        # Build comprehensive metadata
         metadata = {
             "camera": camera_name,
             "timestamp": timestamp,
             "datetime": dt.isoformat(),
-            "motion_detected": detection_result.get("motion_detected", False),
-            "intensity": intensity,
-            "duration": detection_result.get("duration", 0),
-            "confidence": detection_result.get("confidence", 0),
-            "bounding_boxes": detection_result.get("bounding_boxes", []),
-            "image_path": image_path
+            "image_path": image_path,
+            "event_type": event_type,
+            
+            # Motion data
+            "motion": {
+                "detected": motion_detected,
+                "intensity": motion_intensity,
+                "is_vibration": motion_is_vibration,
+                "duration": detection_result.get("duration", 0),
+            },
+            
+            # Human detection data
+            "human": {
+                "detected": human_detected,
+                "confidence": human_confidence,
+                "bounding_boxes": detection_result.get("bounding_boxes", [])
+            }
         }
         
-        # Add YOLO detection data if available
-        if is_integrated:
-            metadata["human_detected"] = human_detected
-            metadata["human_confidence"] = detection_result.get("human_confidence", 0)
+        # Add inventory tracking data if available
+        if inventory_tracking:
+            # Extract relevant inventory data
+            inventory_data = {
+                "access_detected": inventory_access,
+                "change_detected": inventory_change,
+                "zone_id": inventory_tracking.get("zone_id", ""),
+                "zone_name": inventory_tracking.get("zone_name", ""),
+                "access_duration": inventory_tracking.get("access_duration", 0),
+                "change_percentage": inventory_tracking.get("change_percentage", 0),
+                "change_type": inventory_tracking.get("change_type", "")
+            }
             
-            # Add object detection data
-            if "objects_detected" in detection_result:
-                objects = []
-                for obj in detection_result["objects_detected"]:
-                    objects.append({
-                        "class": obj["class"],
-                        "confidence": obj["confidence"],
-                        "box": obj["box"]
-                    })
-                metadata["objects_detected"] = objects
-            
-            # Add YOLO-specific information
-            if "yolo_result" in detection_result:
-                yolo_result = detection_result["yolo_result"]
-                metadata["yolo_inference_time"] = yolo_result.get("inference_time", 0)
-                metadata["yolo_ran"] = not yolo_result.get("yolo_skipped", True)
+            # Add detailed backend data if available
+            if "backend_rules_data" in inventory_tracking:
+                inventory_data["backend_rules_data"] = inventory_tracking["backend_rules_data"]
+                
+            # Add image paths if available
+            if "before_image_path" in inventory_tracking:
+                inventory_data["before_image_path"] = inventory_tracking["before_image_path"]
+            if "after_image_path" in inventory_tracking:
+                inventory_data["after_image_path"] = inventory_tracking["after_image_path"]
+                
+            metadata["inventory"] = inventory_data
         
-        # Add classification data if available
+        # Add event classification data if available
         if "classification" in detection_result:
             metadata["classification"] = detection_result["classification"]
         
+        # Add event IDs if available for correlation
+        if "motion_event_id" in detection_result:
+            metadata["motion_event_id"] = detection_result["motion_event_id"]
+        if "human_event_id" in detection_result:
+            metadata["human_event_id"] = detection_result["human_event_id"]
+        if "inventory_event_id" in detection_result:
+            metadata["inventory_event_id"] = detection_result["inventory_event_id"]
+        
         # Save metadata file
-        metadata_filename = f"{camera_name}_{timestamp_str}_{event_type}{human_indicator}_intensity{intensity}.json"
-        metadata_path = os.path.join(self.output_dir, "clips", metadata_filename)
+        metadata_filename = f"{filename_prefix}.json"
+        metadata_path = str(self.clips_dir / metadata_filename)
         
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=4)
         
-        logger.info(f"Saved event to {image_path}")
+        # Log event based on type
+        log_message = f"Saved {event_type} event from {camera_name}"
         
-        # Log additional information for human detections
-        if human_detected:
-            human_confidence = detection_result.get("human_confidence", 0)
-            logger.info(f"Human detected with confidence: {human_confidence:.2f}")
+        if inventory_change:
+            # Log inventory changes with higher visibility
+            logger.warning(log_message)
+        elif human_detected and human_confidence > 0.7:
+            # Log definite human presence with higher visibility
+            logger.warning(log_message)
+        else:
+            # Log other events at info level
+            logger.info(log_message)
 
 
 if __name__ == "__main__":
@@ -609,17 +553,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SmartVan Monitor System")
     parser.add_argument("--config", default="config.json", help="Path to configuration file")
     parser.add_argument("--no-display", action="store_true", help="Disable video display")
+    parser.add_argument("--vibration-filter", type=int, default=40, 
+                        help="Vibration filter threshold (0-100). Higher values filter more vibrations.")
     args = parser.parse_args()
     
     # Load configuration
     config_path = args.config
     
-    # Create and start the monitor
-    monitor = SmartVanMonitor(config_path=config_path)
-    
-    # Override display setting if specified
-    if args.no_display:
-        monitor.config["display"] = False
-    
-    # Start the monitor
-    monitor.start()
+    try:
+        # Create and start the monitor
+        monitor = SmartVanMonitor(config_path=config_path)
+        
+        # Override display setting if specified
+        if args.no_display:
+            monitor.config["display"] = False
+            
+        # Apply custom vibration filter threshold if specified
+        if args.vibration_filter != 40:
+            logger.info(f"Using custom vibration filter threshold: {args.vibration_filter}")
+            # This will be picked up by the EnhancedDetectionMonitor's process_frame method
+            monitor.config["motion_detection"] = monitor.config.get("motion_detection", {})
+            monitor.config["motion_detection"]["vibration_threshold"] = args.vibration_filter
+        
+        # Start the monitor
+        monitor.start()
+    except Exception as e:
+        logger.error(f"Error starting SmartVan Monitor: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
