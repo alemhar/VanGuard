@@ -299,7 +299,7 @@ class InventoryChangeDetector:
             "duration": duration,
             # Additional fields for backend rule processing
             "sync_status": "PENDING",
-            "van_id": detection_result.get("van_id", "VAN001"),  # Include van_id for fleet identification
+            "van_id": self.config.get("system", {}).get("van_id", "VAN001"),  # Include van_id for fleet identification
             "backend_rules_data": {
                 "access_duration": duration,
                 "change_percentage": change_result.get("change_percentage", 0),

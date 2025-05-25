@@ -171,88 +171,162 @@ class VibrationAnalyzer:
         Returns:
             Dictionary with vibration analysis results
         """
+        # Not enough data for reliable analysis
         if len(self.flow_history) < self.window_size // 2:
             return {
                 "is_vibration": False,
                 "confidence": 0.0,
-                "type": "UNKNOWN",
-                "frequency": 0.0
+                "type": "unknown",
+                "repetitive_movement": False,
+                "frequency": 0.0,
+                "intensity": 0.0
             }
         
-        # Extract features for analysis
-        magnitudes = [entry["magnitude"] for entry in self.flow_history]
-        uniformities = [entry["uniformity"] for entry in self.flow_history]
-        timestamps = [entry["timestamp"] for entry in self.flow_history]
+        # Extract magnitudes and timestamps
+        magnitudes = [item["magnitude"] for item in self.flow_history]
+        timestamps = [item["timestamp"] for item in self.flow_history]
+        uniformities = [item["uniformity"] for item in self.flow_history]
         
-        # Calculate time-based features
-        duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0
-        if duration <= 0:
-            freq = 0
-        else:
-            # Estimate frequency of oscillation using zero crossings
-            # Normalize magnitudes to detect oscillations around mean
-            norm_mags = np.array(magnitudes) - np.mean(magnitudes)
-            zero_crossings = np.where(np.diff(np.signbit(norm_mags)))[0]
-            freq = len(zero_crossings) / (2 * duration) if duration > 0 else 0
+        # Calculate intensity measures
+        max_magnitude = max(magnitudes)
+        avg_magnitude = sum(magnitudes) / len(magnitudes)
+        magnitude_variance = sum((m - avg_magnitude) ** 2 for m in magnitudes) / len(magnitudes)
         
-        # Advanced pattern detection
-        # 1. Check for consistent small magnitude
-        small_consistent_magnitude = (
-            np.mean(magnitudes) < 2.0 and 
-            np.std(magnitudes) / np.mean(magnitudes) < 0.5 if np.mean(magnitudes) > 0 else False
-        )
+        # Calculate temporal features
+        total_time = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.001
+        if total_time <= 0:
+            total_time = 0.001  # Avoid division by zero
+            
+        # Calculate frequency if we have direction changes
+        frequency = 0.0
+        if len(self.direction_change_times) >= 2:
+            # Calculate average time between direction changes
+            change_times = list(self.direction_change_times)
+            time_diffs = [change_times[i+1] - change_times[i] for i in range(len(change_times)-1)]
+            if time_diffs:
+                avg_time_diff = sum(time_diffs) / len(time_diffs)
+                if avg_time_diff > 0:
+                    frequency = 1.0 / avg_time_diff  # frequency in Hz
         
-        # 2. Check for low uniformity (consistent direction)
-        consistent_direction = np.mean(uniformities) < 0.3
+        # Calculate regularity of movement
+        regularity = 0.0
+        if len(magnitudes) >= 3:
+            # Check for alternating patterns in magnitude
+            diffs = [abs(magnitudes[i+1] - magnitudes[i]) for i in range(len(magnitudes)-1)]
+            avg_diff = sum(diffs) / len(diffs)
+            diff_variance = sum((d - avg_diff) ** 2 for d in diffs) / len(diffs)
+            
+            # Low variance in differences indicates regular patterns
+            if avg_diff > 0:
+                regularity = 1.0 - min(1.0, diff_variance / (avg_diff * avg_diff))
+                
+            # Enhanced pattern detection: check for repeating sequence patterns
+            if len(magnitudes) >= 6:
+                # Look for repeating sequences of 2-3 values
+                pattern_detected = False
+                for pattern_length in [2, 3]:
+                    if len(magnitudes) >= pattern_length * 2:
+                        # Compare adjacent segments
+                        for start in range(0, len(magnitudes) - pattern_length * 2 + 1):
+                            segment1 = magnitudes[start:start+pattern_length]
+                            segment2 = magnitudes[start+pattern_length:start+pattern_length*2]
+                            
+                            # Calculate similarity between segments
+                            similarity = 1.0
+                            for i in range(pattern_length):
+                                if max(segment1[i], segment2[i]) > 0:
+                                    similarity *= 1.0 - min(1.0, abs(segment1[i] - segment2[i]) / max(segment1[i], segment2[i]))
+                            
+                            if similarity > 0.85:  # High similarity threshold
+                                pattern_detected = True
+                                regularity = max(regularity, similarity)
+                                break
+                        
+                        if pattern_detected:
+                            break
         
-        # 3. Check for repetitive high-frequency pattern
-        high_frequency = freq > 1.0  # More than 1 oscillation per second
+        # Uniformity analysis: consistently high uniformity suggests vibration
+        avg_uniformity = sum(uniformities) / len(uniformities)
+        uniform_movement = avg_uniformity < 0.3  # Lower values indicate more uniform movement
         
-        # 4. Check for repetitive movement pattern
-        repetitive_movement = (
-            self.direction_changes >= self.rep_movement_threshold and
-            len(self.direction_change_times) >= 2
-        )
-        
-        # Calculate overall vibration confidence
+        # Detect repetitive movements with improved thresholds
+        repetitive_movement = False
+        if (self.direction_changes >= self.rep_movement_threshold and frequency > 0.3) or regularity > 0.7:
+            repetitive_movement = True
+            
+        # Calculate vibration signature based on magnitude pattern
+        signature_strength = 0.0
+        if repetitive_movement and uniform_movement and avg_magnitude < 4.0:
+            signature_strength = min(1.0, (regularity * 0.7 + (1.0 - avg_uniformity) * 0.3))
+            
+        # Detect if this movement pattern matches known vibration patterns
         vibration_confidence = 0.0
-        if small_consistent_magnitude:
-            vibration_confidence += 0.3
-        if consistent_direction:
-            vibration_confidence += 0.3
-        if high_frequency:
-            vibration_confidence += 0.2
+        
+        # Confidence based on frequency (typical van vibrations: 0.5-5 Hz)
+        # Refined based on motion detection settings from memory
+        if 0.5 <= frequency <= 5.0:
+            # Higher confidence for frequencies in the 1.5-3.5 Hz range (common vehicle vibrations)
+            if 1.5 <= frequency <= 3.5:
+                freq_factor = 1.0 - abs(frequency - 2.5) / 2.0  # Peak confidence at 2.5Hz
+                vibration_confidence += freq_factor * 0.3
+            else:
+                freq_factor = 0.7 - abs(frequency - 2.5) / 5.0  # Lower confidence for edge frequencies
+                vibration_confidence += max(0, freq_factor * 0.2)
+        
+        # Confidence based on regularity
+        vibration_confidence += regularity * 0.25
+        
+        # Confidence based on magnitude (typical vibration magnitude is low to moderate)
+        # Improved threshold based on memory settings (flow_magnitude_threshold: 3.5)
+        if max_magnitude < 3.5:
+            mag_factor = 1.0 - (max_magnitude / 3.5)
+            vibration_confidence += mag_factor * 0.2
+        
+        # Confidence based on movement uniformity
+        if uniform_movement:
+            # More uniform movement (low uniformity value) increases vibration confidence
+            vibration_confidence += (1.0 - avg_uniformity) * 0.15
+        
+        # Confidence based on repetitive movement
         if repetitive_movement:
             vibration_confidence += 0.2
             
-        # Determine vibration type
-        vibration_type = "UNKNOWN"
-        if vibration_confidence > 0.6:
-            if high_frequency and small_consistent_magnitude:
-                vibration_type = "HIGH_FREQ_VEHICLE"
-            elif repetitive_movement and consistent_direction:
-                vibration_type = "REPETITIVE_MOVEMENT"
+        # Signature strength provides additional confidence
+        vibration_confidence += signature_strength * 0.2
+            
+        # Determine vibration type with improved frequency classification
+        vibration_type = "unknown"
+        if vibration_confidence > 0.5:
+            if frequency < 1.0:
+                vibration_type = "low_frequency"
+            elif frequency < 3.0:
+                vibration_type = "medium_frequency"
             else:
-                vibration_type = "GENERAL_VIBRATION"
+                vibration_type = "high_frequency"
         
-        # Determine if this is a vibration based on confidence
+        # Calculate motion intensity score - useful for filtering out minor vibrations
+        # Use the significant_motion_threshold from memory: 6.0
+        motion_intensity = avg_magnitude * 10  # Scale for readability
+        
+        # Determine if this is likely a vibration
         is_vibration = vibration_confidence > self.pattern_threshold
         
-        # Log significant vibrations
-        if is_vibration and vibration_confidence > 0.8:
-            logger.debug(
-                f"High confidence vibration detected: {vibration_type}, " +
-                f"Freq={freq:.1f}Hz, Conf={vibration_confidence:.2f}"
-            )
+        # Filter out very low intensity vibrations (threshold: 40 from memory)
+        if is_vibration and motion_intensity < 40:
+            # Keep the vibration flag but with reduced confidence
+            vibration_confidence *= 0.8
         
         return {
             "is_vibration": is_vibration,
             "confidence": vibration_confidence,
             "type": vibration_type,
-            "frequency": freq,
             "repetitive_movement": repetitive_movement,
-            "small_magnitude": small_consistent_magnitude,
-            "consistent_direction": consistent_direction,
+            "frequency": frequency,
+            "regularity": regularity,
+            "intensity": motion_intensity,
+            "max_intensity": max_magnitude,
+            "signature_strength": signature_strength,
+            "uniformity": avg_uniformity,
             "direction_changes": self.direction_changes
         }
     
@@ -330,6 +404,8 @@ class VibrationAnalyzer:
         vibration_analysis = self.analyze_vibration_pattern()
         is_vibration = vibration_analysis["is_vibration"]
         vibration_confidence = vibration_analysis["confidence"]
+        vibration_type = vibration_analysis["type"]
+        repetitive_movement = vibration_analysis.get("repetitive_movement", False)
         
         # Human movement typically has:
         # - Higher magnitude than vehicle vibration
@@ -340,46 +416,113 @@ class VibrationAnalyzer:
         # Edge flow is a good indicator of human movement (entering/exiting frame)
         edge_flow_strength = flow_data.get("edge_flow", 0.0) if flow_data else 0.0
         
-        # Indicators of human presence
-        significant_magnitude = flow_magnitude > 3.0
-        non_uniform_direction = flow_uniformity > 0.4
-        strong_edge_flow = edge_flow_strength > 1.5
-        non_repetitive = not vibration_analysis.get("repetitive_movement", False)
+        # Extract flow components to analyze movement patterns
+        dx = flow_data.get("dx", 0.0) if flow_data else 0.0
+        dy = flow_data.get("dy", 0.0) if flow_data else 0.0
         
-        # Calculate human movement confidence
+        # New: Calculate trajectory features to detect human movement patterns
+        trajectory_score = 0.0
+        if len(self.flow_history) >= 3:
+            # Get last few flow points to analyze trajectory
+            recent_flows = list(self.flow_history)[-3:]
+            
+            # Human movement tends to have consistent direction over short periods
+            dx_values = [item.get("additional_data", {}).get("dx", 0) for item in recent_flows if item.get("additional_data")]
+            dy_values = [item.get("additional_data", {}).get("dy", 0) for item in recent_flows if item.get("additional_data")]
+            
+            if dx_values and dy_values:
+                # Calculate direction consistency (dot product of consecutive vectors)
+                direction_consistency = 0.0
+                for i in range(len(dx_values)-1):
+                    # Normalize vectors
+                    mag1 = max(0.0001, np.sqrt(dx_values[i]**2 + dy_values[i]**2))
+                    mag2 = max(0.0001, np.sqrt(dx_values[i+1]**2 + dy_values[i+1]**2))
+                    
+                    # Calculate normalized dot product (cosine similarity)
+                    dot_product = (dx_values[i] * dx_values[i+1] + dy_values[i] * dy_values[i+1]) / (mag1 * mag2)
+                    direction_consistency += max(0, dot_product)  # Only count positive consistency
+                
+                # Average consistency
+                if len(dx_values) > 1:
+                    direction_consistency /= (len(dx_values) - 1)
+                    trajectory_score = direction_consistency
+        
+        # New: Enhanced edge detection for partial human presence (e.g., hand reaching in)
+        partial_presence_score = 0.0
+        if edge_flow_strength > 1.0:
+            # Calculate the ratio of edge flow to overall flow
+            edge_ratio = edge_flow_strength / (flow_magnitude + 0.0001)  # Avoid division by zero
+            
+            # When edge flow is concentrated and overall flow is low, likely partial presence
+            if edge_ratio > 2.0 and edge_flow_strength > 2.0:
+                partial_presence_score = min(1.0, edge_ratio / 3.0)  # Cap at 1.0
+        
+        # Indicators of human presence with improved thresholds based on memory
+        significant_magnitude = flow_magnitude > 3.5  # Based on memory settings
+        non_uniform_direction = flow_uniformity > 0.5  # Based on memory settings
+        strong_edge_flow = edge_flow_strength > 1.5
+        non_repetitive = not repetitive_movement
+        
+        # Calculate human movement confidence with new factors
         human_confidence = 0.0
         if significant_magnitude:
-            human_confidence += 0.3
+            human_confidence += 0.25
         if non_uniform_direction:
-            human_confidence += 0.2
+            human_confidence += 0.15
         if strong_edge_flow:
-            human_confidence += 0.3
+            human_confidence += 0.25
         if non_repetitive:
-            human_confidence += 0.2
+            human_confidence += 0.15
+        
+        # Add trajectory and partial presence contributions
+        human_confidence += trajectory_score * 0.1  # Max contribution: 0.1
+        human_confidence += partial_presence_score * 0.1  # Max contribution: 0.1
             
         # Determine if this is likely human movement
-        # If vibration confidence is high, require stronger human indicators
-        likely_human = human_confidence > 0.5
-        if vibration_confidence > 0.7:
-            # With high vibration confidence, require more human evidence
-            likely_human = human_confidence > 0.7
+        # Vibration intensity filtering: completely ignore low intensity vibrations (< 40)
+        if flow_magnitude < 1.5 and vibration_confidence > 0.5:
+            likely_human = False
+            human_confidence *= 0.5  # Reduce confidence for very low magnitudes with vibration
+        else:
+            # If vibration confidence is high, require stronger human indicators
+            likely_human = human_confidence > 0.5
+            if vibration_confidence > 0.7:
+                # With high vibration confidence, require more human evidence
+                likely_human = human_confidence > 0.7
+        
+        # New: Detection refinements based on motion patterns
+        # Repetitive, high-frequency movements with low magnitude are likely vibrations
+        if repetitive_movement and vibration_analysis.get("frequency", 0) > 2.0 and flow_magnitude < 4.0:
+            likely_human = False
+            human_confidence *= 0.7  # Reduce confidence but don't eliminate completely
             
         # Special case: very strong edge flow almost always indicates human
         if strong_edge_flow and edge_flow_strength > 3.0:
             likely_human = True
+            human_confidence = max(human_confidence, 0.8)  # Ensure high confidence
             
         # Special case: very high magnitude with non-uniform direction
         if flow_magnitude > 5.0 and flow_uniformity > 0.6:
             likely_human = True
+            human_confidence = max(human_confidence, 0.8)  # Ensure high confidence
+            
+        # New: Strong partial presence detection
+        if partial_presence_score > 0.7:
+            likely_human = True
+            human_confidence = max(human_confidence, 0.75)  # High but not maximum confidence
             
         return {
             "is_vibration": is_vibration,
             "vibration_confidence": vibration_confidence,
-            "vibration_type": vibration_analysis["type"],
+            "vibration_type": vibration_type,
             "likely_human": likely_human,
             "human_confidence": human_confidence,
             "flow_magnitude": flow_magnitude,
-            "flow_uniformity": flow_uniformity
+            "flow_uniformity": flow_uniformity,
+            "edge_flow": edge_flow_strength,
+            "trajectory_score": trajectory_score,
+            "partial_presence_score": partial_presence_score,
+            "repetitive_movement": repetitive_movement
         }
     
     def reset(self) -> None:

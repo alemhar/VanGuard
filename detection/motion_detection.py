@@ -229,7 +229,7 @@ class MotionDetector:
             self.prev_gray = frame.copy()
             return {"magnitude": 0.0, "uniformity": 1.0, "is_vibration": False, "likely_human": False}
         
-        # Calculate optical flow
+        # Calculate optical flow with optimized parameters for better motion detection
         flow = cv2.calcOpticalFlowFarneback(
             self.prev_gray, frame, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         
@@ -239,21 +239,68 @@ class MotionDetector:
         # Get average flow magnitude
         flow_magnitude = np.mean(mag)
         
-        # Calculate flow uniformity (standard deviation of angles)
-        # High uniformity (low std dev) suggests whole-frame movement like vehicle motion
-        # Low uniformity (high std dev) suggests localized movement like human access
-        # Mask out areas with very low magnitude
+        # Enhanced flow uniformity calculation with weighted regions
+        # This helps better distinguish between uniform vehicle vibrations and non-uniform human movements
         mask = mag > 0.5
         if np.any(mask):
             angles_of_interest = ang[mask]
-            angle_std = np.std(angles_of_interest)
+            # Use magnitudes as weights to emphasize stronger movements
+            weights = mag[mask] / np.sum(mag[mask])
+            # Calculate weighted std dev of angles
+            mean_angle = np.average(angles_of_interest, weights=weights)
+            angle_variance = np.average((angles_of_interest - mean_angle)**2, weights=weights)
+            angle_std = np.sqrt(angle_variance)
+            
             # Normalize to 0-1 range (higher value means less uniform, more likely human activity)
+            # Using the optimized flow_uniformity_threshold from config (0.5)
             flow_uniformity = min(1.0, angle_std / np.pi)
         else:
             flow_uniformity = 0.0
         
         # Extract additional flow components for enhanced analysis
         flow_components = self.vibration_analyzer.extract_flow_components(flow)
+        
+        # Enhance edge detection for partial human presence (like hands reaching into frame)
+        # Calculate additional edge metrics for the flow components
+        h, w = flow.shape[:2]
+        edge_margin = max(int(min(h, w) * 0.15), 15)  # Increased edge margin (15% of frame)
+        
+        # Extract flow in edge regions with finer detail
+        edge_regions = {
+            "top": flow[:edge_margin, :, :],
+            "bottom": flow[-edge_margin:, :, :],
+            "left": flow[:, :edge_margin, :],
+            "right": flow[:, -edge_margin:, :]
+        }
+        
+        # Calculate directional edge flows (useful for detecting entry/exit)
+        edge_directional_flows = {}
+        for region_name, region in edge_regions.items():
+            if region.size > 0:
+                if region_name == "top":
+                    # Flow coming from top should have positive y component
+                    direction_component = np.mean(region[..., 1])
+                    entry_flow = max(0, direction_component)  # Only count positive flow (entry)
+                elif region_name == "bottom":
+                    # Flow coming from bottom should have negative y component
+                    direction_component = np.mean(region[..., 1])
+                    entry_flow = max(0, -direction_component)  # Only count negative flow (entry)
+                elif region_name == "left":
+                    # Flow coming from left should have positive x component
+                    direction_component = np.mean(region[..., 0])
+                    entry_flow = max(0, direction_component)  # Only count positive flow (entry)
+                elif region_name == "right":
+                    # Flow coming from right should have negative x component
+                    direction_component = np.mean(region[..., 0])
+                    entry_flow = max(0, -direction_component)  # Only count negative flow (entry)
+                
+                edge_directional_flows[region_name] = entry_flow
+        
+        # Add directional edge flows to flow components
+        flow_components.update({
+            "edge_directional_flows": edge_directional_flows,
+            "max_entry_flow": max(edge_directional_flows.values()) if edge_directional_flows else 0.0
+        })
         
         # Use enhanced vibration analyzer for better pattern detection
         # This analyzes temporal patterns across frames to detect repetitive movements
@@ -269,6 +316,22 @@ class MotionDetector:
         vibration_type = enhanced_detection["vibration_type"]
         likely_human = enhanced_detection["likely_human"]
         human_confidence = enhanced_detection["human_confidence"]
+        
+        # Extract additional metrics for more nuanced detection
+        trajectory_score = enhanced_detection.get("trajectory_score", 0.0)
+        partial_presence_score = enhanced_detection.get("partial_presence_score", 0.0)
+        motion_intensity = enhanced_detection.get("intensity", 0.0)
+        
+        # Use motion intensity to filter out low-intensity vibrations
+        # Based on the memory config value of motion_intensity_threshold: 40
+        if is_vibration and motion_intensity < 40:
+            vibration_confidence *= 0.7  # Reduce confidence for low intensity vibrations
+        
+        # Enhanced human detection based on trajectory and edge entry flow
+        if not likely_human and flow_components.get("max_entry_flow", 0) > 2.0:
+            # Strong entry flow suggests something entering the frame
+            likely_human = True
+            human_confidence = max(human_confidence, 0.65)  # Boost confidence but not to maximum
         
         # If enhanced vibration detection is very confident, override the default detection
         # but make sure human detection still takes precedence when strong evidence exists
@@ -295,7 +358,11 @@ class MotionDetector:
             "vibration_confidence": vibration_confidence,
             "vibration_type": vibration_type,
             "human_confidence": human_confidence,
-            "flow_components": flow_components
+            "flow_components": flow_components,
+            "trajectory_score": trajectory_score,
+            "partial_presence_score": partial_presence_score,
+            "motion_intensity": motion_intensity,
+            "max_entry_flow": flow_components.get("max_entry_flow", 0.0)
         }
     
     def detect(self, frame: np.ndarray) -> Dict[str, Any]:
