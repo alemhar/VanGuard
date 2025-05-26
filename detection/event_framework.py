@@ -17,6 +17,7 @@ import logging
 import json
 import os
 import uuid
+import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 
@@ -602,6 +603,41 @@ class EnhancedEventClassifier:
         
         return confidence
     
+    def _ensure_json_serializable(self, obj):
+        """
+        Ensure all values in dict/list are JSON serializable (convert numpy types to Python types)
+        """
+        if isinstance(obj, dict):
+            return {k: self._ensure_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._ensure_json_serializable(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._ensure_json_serializable(item) for item in obj)
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.float32) or isinstance(obj, np.float64):
+            # Explicitly handle numpy float types
+            return float(obj)
+        elif isinstance(obj, np.int32) or isinstance(obj, np.int64):
+            # Explicitly handle numpy int types
+            return int(obj)
+        elif isinstance(obj, np.bool_):
+            # Handle numpy boolean type
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            # For image data in results, convert small arrays to lists
+            return obj.tolist() if obj.size < 1000 else f"<ndarray shape={obj.shape}>"
+        elif str(type(obj)).startswith("<class 'numpy"):
+            # Catch any other numpy types
+            try:
+                return obj.item()
+            except:
+                return str(obj)
+        else:
+            return obj
+    
     def _save_event(self, event: Dict[str, Any]) -> None:
         """
         Save event to disk for persistence.
@@ -618,9 +654,12 @@ class EnhancedEventClassifier:
         filename = f"{camera_name}_{timestamp_str}_{event_type}_{event_id}.json"
         filepath = self.events_dir / filename
         
+        # Ensure all values are JSON serializable (convert numpy types)
+        serializable_event = self._ensure_json_serializable(event)
+        
         # Save to disk
         with open(filepath, 'w') as f:
-            json.dump(event, f, indent=4)
+            json.dump(serializable_event, f, indent=4)
     
     def get_recent_events(self, 
                          camera_name: str = None,

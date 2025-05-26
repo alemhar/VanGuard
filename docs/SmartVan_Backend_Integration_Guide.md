@@ -57,7 +57,11 @@ The system communicates with the following endpoints on the backend server:
     "all_active": true           // Whether all registered cameras are functioning
   },
   "detectors_status": {          // Detection subsystem status
-    "detectors_active": true     // Whether all detection algorithms are functioning
+    "detectors_active": true,    // Whether all detection algorithms are functioning
+    "motion_detector": true,     // Status of motion detection subsystem
+    "inventory_detector": true,  // Status of inventory change detection
+    "yolo_detector": true,      // Status of YOLO human detection
+    "yolo_model": "tiny"        // Current YOLO model size (tiny, medium, large)
   }
 }
 ```
@@ -73,7 +77,9 @@ The system communicates with the following endpoints on the backend server:
   "event_type": "INVENTORY_CHANGE",        // Type of event (INVENTORY_CHANGE, HUMAN_PRESENT, MOTION)
   "event_id": "motion_20250525_1715",     // Unique ID for correlating events across systems
   "human_detection": {                    // Human presence information (if detected)
+    "detected": true,                     // Whether a human was detected in the frame
     "confidence": 0.85,                   // Confidence score for human detection (0-1)
+    "detection_method": "YOLO",           // Detection method (YOLO, MOTION, COMBINED)
     "count": 1                            // Number of humans detected in frame
   },
   "inventory": {                          // Inventory-related information
@@ -131,7 +137,17 @@ The system communicates with the following endpoints on the backend server:
   },
   "false_positive_reasons": {     // Categorized reasons for false positives
     "vibration": 2,               // False positives due to vehicle vibration
-    "lighting_change": 1          // False positives due to lighting changes
+    "lighting_change": 1,         // False positives due to lighting changes
+    "no_human_detected": 3        // Events without human detection confirmation
+  },
+  "yolo_metrics": {              // YOLO object detection metrics
+    "avg_inference_time": 0.145, // Average inference time in seconds
+    "detections_count": 127,     // Total number of successful detections
+    "objects_detected": {        // Count of detected object classes
+      "person": 42,             // Number of person detections
+      "backpack": 15,           // Number of backpack detections
+      "handbag": 7              // Number of handbag detections
+    }
   }
 }
 ```

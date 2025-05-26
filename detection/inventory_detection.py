@@ -24,8 +24,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional, Union
 
-# Import performance metrics tracker
+# Import performance metrics tracker and YOLO detector
 from detection.performance_metrics import PerformanceTracker
+from detection.object_detection.yolo_detector import YOLODetector
 
 # Configure logging
 logging.basicConfig(
@@ -57,7 +58,9 @@ class InventoryChangeDetector:
                 min_change_area: int = 200,       # Minimum size of change area in pixels
                 state_memory_window: int = 3600,  # How long to remember inventory states (seconds)
                 config: Dict[str, Any] = None,    # Configuration dictionary
-                enable_performance_tracking: bool = True):  # Whether to track performance metrics
+                enable_performance_tracking: bool = True,  # Whether to track performance metrics
+                enable_yolo: bool = True,        # Whether to use YOLO for human detection
+                yolo_model_size: str = "tiny"):  # YOLO model size (tiny, medium, large)
         """
         Initialize the inventory change detector.
         
@@ -76,6 +79,8 @@ class InventoryChangeDetector:
         self.min_change_area = min_change_area
         self.state_memory_window = state_memory_window
         self.enable_performance_tracking = enable_performance_tracking
+        self.enable_yolo = enable_yolo
+        self.yolo_model_size = yolo_model_size
         
         # Initialize configuration dictionary
         self.config = config if config is not None else {}
@@ -93,6 +98,16 @@ class InventoryChangeDetector:
             # Create performance tracker instance
             self.performance_tracker = PerformanceTracker(output_dir=str(self.output_dir))
             logger.info(f"Performance tracking enabled")
+        
+        # Initialize YOLO detector if enabled
+        self.yolo_detector = None
+        if self.enable_yolo:
+            try:
+                self.yolo_detector = YOLODetector(model_size=self.yolo_model_size)
+                logger.info(f"YOLO detector initialized with {self.yolo_model_size} model")
+            except Exception as e:
+                logger.error(f"Failed to initialize YOLO detector: {e}")
+                self.enable_yolo = False
         
         logger.info("Inventory change detector initialized")
         logger.info(f"Change threshold: {self.change_threshold}, Min area: {self.min_change_area}")
@@ -250,12 +265,27 @@ class InventoryChangeDetector:
             return int(obj)
         elif isinstance(obj, np.floating):
             return float(obj)
+        elif isinstance(obj, np.float32) or isinstance(obj, np.float64):
+            # Explicitly handle numpy float types
+            return float(obj)
+        elif isinstance(obj, np.int32) or isinstance(obj, np.int64):
+            # Explicitly handle numpy int types
+            return int(obj)
+        elif isinstance(obj, np.bool_):
+            # Handle numpy boolean type
+            return bool(obj)
         elif isinstance(obj, np.ndarray):
             # For image data in results, convert small arrays to lists or just return shape info for large ones
             if obj.size < 1000:  # Small array, convert to list
                 return obj.tolist()
             else:  # Large array, just return shape info
                 return f"<ndarray shape={obj.shape} dtype={obj.dtype}>"
+        elif str(type(obj)).startswith("<class 'numpy"):
+            # Catch any other numpy types not explicitly handled
+            try:
+                return obj.item()
+            except:
+                return str(obj)
         else:
             return obj
     
@@ -363,9 +393,8 @@ class InventoryChangeDetector:
         serializable_result = self._ensure_json_serializable(change_result)
         
         return serializable_result
-    
     def _analyze_inventory_change(self, before_image: np.ndarray, after_image: np.ndarray, 
-                                 duration: float, camera_name: str, zone_id: str) -> Dict[str, Any]:
+                             duration: float, camera_name: str, zone_id: str) -> Dict[str, Any]:
         """
         Analyze changes between before and after images of inventory zone.
         Implements lighting-invariant detection and improved item classification.
@@ -396,8 +425,29 @@ class InventoryChangeDetector:
             zone_config = self.config["zones"][zone_id]
             zone_threshold = zone_config.get("change_threshold", self.change_threshold)
             zone_min_area = zone_config.get("min_change_area", self.min_change_area)
+            
+        # Check for human presence using YOLO if enabled
+        person_detected = False
+        human_confidence = 0.0
+        if self.enable_yolo and self.yolo_detector is not None:
+            # Run YOLO detection on the after image (current state)
+            try:
+                yolo_result = self.yolo_detector.detect(after_image)
+                person_detected = yolo_result.get("person_detected", False)
+                
+                # Get confidence of person detection if available
+                for obj in yolo_result.get("objects_detected", []):
+                    if obj.get("class") == "person":
+                        human_confidence = obj.get("confidence", 0.0)
+                        break
+                        
+                logger.debug(f"YOLO detection: person_detected={person_detected}, confidence={human_confidence}")
+            except Exception as e:
+                logger.error(f"YOLO detection failed: {e}")
+                # Continue without YOLO results
+        
         # Then try nested lookup by camera (for production format)
-        elif "zones" in self.config and camera_name in self.config.get("zones", {}) and zone_id in self.config["zones"].get(camera_name, {}):
+        if not "zones" in self.config and camera_name in self.config.get("zones", {}) and zone_id in self.config["zones"].get(camera_name, {}):
             # Use zone-specific settings from config (production format)
             zone_config = self.config["zones"][camera_name][zone_id]
             zone_threshold = zone_config.get("change_threshold", self.change_threshold)
@@ -497,6 +547,15 @@ class InventoryChangeDetector:
         # Special handling for zone-specific tests
         is_zone_sensitivity_test = zone_id in ["test_zone_standard", "test_zone_sensitive", "test_zone_tolerant"]
         
+        # Increase confidence in the detection if a person is detected by YOLO
+        yolo_detection_boost = 0
+        if person_detected:
+            # Stronger boost for higher confidence detections
+            if human_confidence > 0.7:
+                yolo_detection_boost = 2  # High confidence detection
+            elif human_confidence > 0.5:
+                yolo_detection_boost = 1  # Medium confidence detection
+                
         # Special test zone handling
         if "lighting" in zone_id.lower():
             # This is specifically a lighting test - force to false
@@ -532,14 +591,25 @@ class InventoryChangeDetector:
             change_detected = False
         else:
             # Normal case for production environments - more strict filtering
-            change_detected = (
-                change_percentage > adjusted_threshold and
-                len(significant_contours) > 0 and
-                not is_lighting_change and  # Not primarily a lighting change
-                (has_histogram_change or is_texture_different)  # Either histogram or texture must change
-            )
+            # Person detection helps distinguish lighting changes from actual inventory access
+            if person_detected and human_confidence > 0.6:
+                # If we have high confidence person detection, we can be more lenient with other factors
+                # This helps with scenarios like opening van doors (lighting changes with human presence)
+                change_detected = (
+                    change_percentage > (adjusted_threshold * 0.8) and  # 20% more lenient threshold
+                    len(significant_contours) > 0
+                )
+                logger.info(f"YOLO detected person with high confidence ({human_confidence:.2f}), using more lenient detection")
+            else:
+                # Standard detection logic when no person is detected
+                change_detected = (
+                    change_percentage > adjusted_threshold and
+                    len(significant_contours) > 0 and
+                    not is_lighting_change and  # Not primarily a lighting change
+                    (has_histogram_change or is_texture_different)  # Either histogram or texture must change
+                )
         
-        # Determine event type and confidence
+        # Determine event type and confidence level
         if not change_detected:
             event_type = self.EVENT_NO_CHANGE
             confidence = self.CONFIDENCE_LOW
@@ -615,7 +685,7 @@ class InventoryChangeDetector:
             else:
                 event_type = self.EVENT_ITEM_ADDITION
                 confidence = self.CONFIDENCE_LOW  # Lower confidence due to mixed signals
-            
+                
             # Track size distribution of changed items
             size_distribution = {"small": 0, "medium": 0, "large": 0}
             item_sizes = []
@@ -641,11 +711,17 @@ class InventoryChangeDetector:
             # Higher confidence for longer interactions
             if duration > 5.0 and confidence < self.CONFIDENCE_HIGH:
                 confidence += 1
+                
+            # Boost confidence based on YOLO person detection
+            if yolo_detection_boost > 0 and confidence < self.CONFIDENCE_HIGH:
+                confidence = min(confidence + yolo_detection_boost, self.CONFIDENCE_HIGH)
+                logger.info(f"Boosting confidence due to YOLO person detection (boost={yolo_detection_boost})")
         
         # Prepare enhanced result with more detailed metrics
         result = {
             "event_type": event_type,
             "change_detected": change_detected,
+            # ... (rest of the result remains the same)
             "confidence": confidence,
             "change_percentage": float(change_percentage),
             "changed_pixels": int(changed_pixels),
@@ -654,6 +730,11 @@ class InventoryChangeDetector:
             "diff_image": diff_visualization if change_detected else None,
             "zone_id": zone_id,
             "camera_name": camera_name,
+            "person_detected": person_detected,
+            "human_confidence": float(human_confidence) if person_detected else 0.0,
+            "item_sizes": item_sizes if change_detected else [],
+            "size_distribution": size_distribution if change_detected else {"small": 0, "medium": 0, "large": 0},
+            "dominant_size": max(size_distribution, key=size_distribution.get) if change_detected and len(significant_contours) > 0 else "none",
             "analysis": {
                 "significant_contours": len(significant_contours),
                 "change_threshold": float(zone_threshold),  # Zone-specific threshold

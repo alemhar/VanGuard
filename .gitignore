@@ -37,6 +37,14 @@ output/
 *.log
 config.json
 
+# YOLO model files
+detection/models/*.weights
+detection/models/*.cfg
+models/*.weights
+models/*.cfg
+*.weights
+# Large binary files that should be downloaded instead of versioned
+
 # Testing data and results
 testing/test_data/
 testing/test_results/
