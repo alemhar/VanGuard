@@ -66,6 +66,7 @@ This guide outlines how to implement the SmartVan anomaly detection system using
        $table->id();
        $table->foreignId('event_id')->constrained();
        $table->foreignId('transaction_id')->constrained('pos_transactions');
+       $table->integer('item_count')->default(1);
        $table->timestamp('matched_at');
        $table->string('match_type')->default('AUTOMATIC'); // AUTOMATIC or MANUAL
        $table->string('matched_by')->nullable(); // User ID if manual
@@ -189,11 +190,52 @@ class AnomalyDetectionService
         
         // Check for inventory removal without POS transaction
         if ($this->isItemRemovalEvent($event)) {
-            $transaction = $this->findUnmatchedPosTransaction($event);
+            // Extract inventory data
+            $inventoryData = json_decode($event->inventory, true);
+            $itemsRemoved = isset($inventoryData['quantity_changed']) ? (int)$inventoryData['quantity_changed'] : 1;
+            
+            $transaction = $this->findMatchablePosTransaction($event);
             
             if ($transaction) {
-                // Create match record to prevent reuse
-                $this->createEventTransactionMatch($event, $transaction);
+                // Create match record with quantity tracking
+                $match = $this->createEventTransactionMatch($event, $transaction);
+                
+                // Check if there are unmatched items (partial match scenario)
+                if ($match->item_count < $itemsRemoved) {
+                    $unmatchedItems = $itemsRemoved - $match->item_count;
+                    
+                    // Add partial anomaly score based on proportion of unmatched items
+                    $anomalyScore += 0.20 * ($unmatchedItems / $itemsRemoved);
+                    $anomalyReasons[] = 'PARTIAL_MATCH_TRANSACTION';
+                }
+                
+                // Check for potential over-counting (detected more than expected plus allowance)
+                $allowancePercentage = $transaction->vanConfiguration?->quantity_allowance_percentage ?? 20;
+                $maxAllowedQuantity = $transaction->total_quantity * (1 + ($allowancePercentage / 100));
+                
+                // Calculate total detected quantity for this transaction including this event
+                $totalDetectedQuantity = $transaction->matched_quantity;
+                
+                if ($totalDetectedQuantity > $maxAllowedQuantity) {
+                    // Detected more items than expected (beyond allowance)
+                    $excessQuantity = $totalDetectedQuantity - $transaction->total_quantity;
+                    $anomalyScore += 0.15;
+                    $anomalyReasons[] = 'EXCESS_QUANTITY_DETECTED';
+                    
+                    // Log the potential over-counting anomaly
+                    AnomalyLog::create([
+                        'event_id' => $event->id,
+                        'transaction_id' => $transaction->id,
+                        'anomaly_type' => 'OVER_COUNTING',
+                        'details' => json_encode([
+                            'expected_quantity' => $transaction->total_quantity,
+                            'max_allowed_quantity' => $maxAllowedQuantity,
+                            'detected_quantity' => $totalDetectedQuantity,
+                            'excess_quantity' => $excessQuantity,
+                            'allowance_percentage' => $allowancePercentage
+                        ])
+                    ]);
+                }
             } else {
                 // No matching transaction found
                 $anomalyScore += 0.20;
@@ -226,23 +268,45 @@ class AnomalyDetectionService
         return null;
     }
     
-    protected function findUnmatchedPosTransaction(Event $event)
+    protected function findMatchablePosTransaction(Event $event)
     {
         $windowStart = Carbon::createFromTimestamp($event->event_timestamp)->subMinutes(30);
         $windowEnd = Carbon::createFromTimestamp($event->event_timestamp)->addMinutes(30);
         
-        // Find transactions in the window that haven't been matched yet
+        // Extract inventory data
+        $inventoryData = json_decode($event->inventory, true);
+        $itemsRemoved = isset($inventoryData['quantity_changed']) ? (int)$inventoryData['quantity_changed'] : 1;
+        
+        // Find transactions in the window that still have capacity
         return PosTransaction::where('van_id', $event->van_id)
             ->whereBetween('transaction_timestamp', [$windowStart, $windowEnd])
-            ->whereDoesntHave('eventMatches') // Only get unmatched transactions
+            ->where(function($query) {
+                // Find transactions that have available capacity
+                $query->whereRaw('(SELECT COALESCE(SUM(item_count), 0) FROM event_transaction_matches 
+                                  WHERE transaction_id = pos_transactions.id) < pos_transactions.total_quantity');
+            })
+            ->orderBy('transaction_timestamp', 'desc') // Match most recent first
             ->first();
     }
     
     protected function createEventTransactionMatch(Event $event, PosTransaction $transaction)
     {
+        // Extract inventory data to get quantity removed
+        $inventoryData = json_decode($event->inventory, true);
+        $itemsRemoved = isset($inventoryData['quantity_changed']) ? (int)$inventoryData['quantity_changed'] : 1;
+        
+        // Calculate how many items are already matched to this transaction
+        $alreadyMatchedCount = \App\Models\EventTransactionMatch::where('transaction_id', $transaction->id)
+            ->sum('item_count');
+            
+        // Calculate how many more items we can match (don't exceed transaction total)
+        $remainingTransactionQuantity = $transaction->total_quantity - $alreadyMatchedCount;
+        $itemsToMatch = min($itemsRemoved, $remainingTransactionQuantity);
+        
         return \App\Models\EventTransactionMatch::create([
             'event_id' => $event->id,
             'transaction_id' => $transaction->id,
+            'item_count' => $itemsToMatch,
             'matched_at' => now(),
             'match_type' => 'AUTOMATIC'
         ]);
@@ -795,6 +859,296 @@ services:
 3. **Set up Slack notifications** for critical anomalies
 4. **Configure structured logging** to a centralized log management system
 
+## Transaction Completion Tracking
+
+To handle the one-to-many relationship between POS transactions and inventory events (where a single transaction for multiple items results in several inventory access events), the system includes specialized handling:
+
+```php
+class PosTransaction extends Model
+{
+    protected $casts = [
+        'transaction_timestamp' => 'datetime',
+        'completed_at' => 'datetime',
+    ];
+    
+    protected $fillable = [
+        'transaction_id',
+        'van_id',
+        'transaction_timestamp',
+        'total_quantity',
+        'items',
+        'customer_id',
+        'delivery_status',
+        'completed_at',
+        'completion_type',
+    ];
+    
+    // Relationship to van configuration for per-van settings
+    public function vanConfiguration()
+    {
+        return $this->belongsTo(VanConfiguration::class, 'van_id', 'van_id');
+    }
+    
+    // Relationship with event matches
+    public function eventMatches()
+    {
+        return $this->hasMany(EventTransactionMatch::class, 'transaction_id');
+    }
+    
+    // Calculate how much of this transaction has been matched to events
+    public function getMatchedQuantityAttribute()
+    {
+        return $this->eventMatches()->sum('item_count');
+    }
+    
+    // Calculate remaining quantity available for matching
+    public function getRemainingQuantityAttribute()
+    {
+        return $this->total_quantity - $this->matched_quantity;
+    }
+    
+    // Check if transaction is fully utilized (all items accounted for)
+    public function getIsFullyUtilizedAttribute()
+    {
+        return $this->remaining_quantity <= 0;
+    }
+    
+    // Check if the transaction is completed
+    public function getIsCompletedAttribute()
+    {
+        return !is_null($this->completed_at);
+    }
+    
+    // Mark a transaction as completed when all items have been delivered
+    public function markAsCompleted($completionType = 'AUTOMATIC')
+    {
+        if (!$this->is_completed && $this->is_fully_utilized) {
+            $this->update([
+                'completed_at' => now(),
+                'completion_type' => $completionType,
+                'delivery_status' => 'COMPLETED'
+            ]);
+            
+            // Trigger notification or event
+            event(new TransactionCompleted($this));
+            
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // Check if the transaction is stalled (incomplete after expected time)
+    public function getIsStalledAttribute()
+    {
+        if ($this->is_completed) {
+            return false;
+        }
+        
+        // Get van-specific stalled hours threshold (default to 2 hours)
+        $stalledHoursThreshold = $this->vanConfiguration?->stalled_transaction_hours ?? 2;
+        
+        // Check if it's been more than the threshold time since the last event match
+        $lastEventTime = $this->eventMatches()
+            ->orderBy('created_at', 'desc')
+            ->first()
+            ?->created_at;
+            
+        if (!$lastEventTime) {
+            $lastEventTime = $this->transaction_timestamp;
+        }
+        
+        $hoursSinceLastActivity = now()->diffInHours($lastEventTime);
+        
+        // Check if the van allowance percentage has been met
+        $allowancePercentage = $this->vanConfiguration?->quantity_allowance_percentage ?? 20;
+        $minimumRequiredQuantity = $this->total_quantity * (1 - ($allowancePercentage / 100));
+        
+        // Consider stalled only if below minimum required quantity and inactive
+        return $hoursSinceLastActivity > $stalledHoursThreshold && 
+               $this->matched_quantity < $minimumRequiredQuantity;
+    }
+}
+```
+
+### Transaction Completion Service
+
+A dedicated service monitors and manages transaction completion:
+
+```php
+class TransactionCompletionService
+{
+    // Check for completed transactions
+    public function processCompletedTransactions()
+    {
+        // Get all active transactions that aren't completed yet
+        $transactions = PosTransaction::whereNull('completed_at')
+            ->with('vanConfiguration') // Eager load van configuration for allowance settings
+            ->get();
+            
+        $completed = [];
+        
+        foreach ($transactions as $transaction) {
+            // Get the van-specific allowance percentage (default to 20% if not set)
+            $allowancePercentage = $transaction->vanConfiguration?->quantity_allowance_percentage ?? 20;
+            
+            // Calculate the minimum quantity needed for completion with allowance
+            $minimumRequiredQuantity = $transaction->total_quantity * (1 - ($allowancePercentage / 100));
+            
+            // Check if the matched quantity meets or exceeds the required minimum
+            if ($transaction->matched_quantity >= $minimumRequiredQuantity) {
+                $transaction->markAsCompleted();
+                $completed[] = $transaction;
+            }
+        }
+        
+        return count($completed);
+    }
+    
+    // Check for stalled transactions (incomplete after timeout)
+    public function checkStalledTransactions()
+    {
+        // Get all incomplete transactions with their van configurations
+        $transactions = PosTransaction::whereNull('completed_at')
+            ->with('vanConfiguration')
+            ->get();
+            
+        $stalledTransactions = [];
+        
+        foreach ($transactions as $transaction) {
+            // Get van-specific stalled hours threshold (default to 2 hours)
+            $stalledHoursThreshold = $transaction->vanConfiguration?->stalled_transaction_hours ?? 2;
+            $cutoffTime = now()->subHours($stalledHoursThreshold);
+            
+            // Get the timestamp of last activity
+            $lastEventTime = $transaction->eventMatches()
+                ->orderBy('created_at', 'desc')
+                ->first()
+                ?->created_at ?? $transaction->transaction_timestamp;
+                
+            // Get the van-specific allowance percentage
+            $allowancePercentage = $transaction->vanConfiguration?->quantity_allowance_percentage ?? 20;
+            $minimumRequiredQuantity = $transaction->total_quantity * (1 - ($allowancePercentage / 100));
+            
+            // Check if transaction is stalled
+            if ($lastEventTime < $cutoffTime && $transaction->matched_quantity < $minimumRequiredQuantity) {
+                $stalledTransactions[] = $transaction;
+            }
+        }
+        
+        $alerts = [];
+        foreach ($stalledTransactions as $transaction) {
+            ->get();
+            
+        $alerts = [];
+        foreach ($transactions as $transaction) {
+            // Create a stalled transaction alert
+            $alert = Alert::create([
+                'alert_type' => 'STALLED_TRANSACTION',
+                'source_id' => $transaction->id,
+                'source_type' => 'transaction',
+                'van_id' => $transaction->van_id,
+                'severity' => 'MEDIUM',
+                'details' => json_encode([
+                    'transaction_id' => $transaction->transaction_id,
+                    'expected_quantity' => $transaction->total_quantity,
+                    'delivered_quantity' => $transaction->matched_quantity,
+                    'remaining_quantity' => $transaction->remaining_quantity,
+                    'hours_since_activity' => now()->diffInHours($transaction->updated_at)
+                ])
+            ]);
+            
+            $alerts[] = $alert;
+        }
+        
+        return $alerts;
+    }
+    
+    // Manually complete a transaction (administrative function)
+    public function manuallyCompleteTransaction($transactionId, $userId, $notes = null)
+    {
+        $transaction = PosTransaction::findOrFail($transactionId);
+        
+        // Create an audit log entry
+        $auditLog = AuditLog::create([
+            'user_id' => $userId,
+            'action' => 'MANUAL_TRANSACTION_COMPLETION',
+            'resource_type' => 'transaction',
+            'resource_id' => $transaction->id,
+            'old_value' => json_encode([
+                'delivery_status' => $transaction->delivery_status,
+                'matched_quantity' => $transaction->matched_quantity,
+                'remaining_quantity' => $transaction->remaining_quantity
+            ]),
+            'notes' => $notes
+        ]);
+        
+        $result = $transaction->markAsCompleted('MANUAL');
+        
+        return [
+            'success' => $result,
+            'audit_log_id' => $auditLog->id
+        ];
+    }
+}
+```
+
+## Van Configuration
+
+The system includes a configuration model for van-specific settings:
+
+```php
+class VanConfiguration extends Model
+{
+    protected $fillable = [
+        'van_id',
+        'quantity_allowance_percentage',  // Default: 20%
+        'stalled_transaction_hours',      // Default: 2 hours
+        'default_items_per_trip',         // Default estimate of items per trip
+        'settings'
+    ];
+    
+    protected $casts = [
+        'settings' => 'array',
+    ];
+    
+    // Get the quantity allowance for this van (with default fallback)
+    public function getQuantityAllowancePercentageAttribute($value)
+    {
+        return $value ?? 20; // Default to 20% if not explicitly set
+    }
+    
+    // Get the stalled hours threshold (with default fallback)
+    public function getStalledTransactionHoursAttribute($value)
+    {
+        return $value ?? 2; // Default to 2 hours if not explicitly set
+    }
+}
+```
+
+### Van Configuration Migration
+
+```php
+Schema::create('van_configurations', function (Blueprint $table) {
+    $table->id();
+    $table->string('van_id')->unique();
+    $table->integer('quantity_allowance_percentage')->nullable();
+    $table->integer('stalled_transaction_hours')->nullable();
+    $table->integer('default_items_per_trip')->nullable();
+    $table->json('settings')->nullable();
+    $table->timestamps();
+});
+```
+
+## Dashboard Visualization
+
+The dashboard provides visualizations showing transaction utilization:
+
+1. **Quantity Matching**: Shows how many items from each transaction have been matched to inventory events
+2. **Transaction Completeness**: Visual indicator for fully utilized vs. partially utilized transactions
+3. **Timeline View**: Connecting multiple removal events to their parent transaction
+4. **Van Configuration Panel**: Interface to adjust per-van settings like quantity allowance percentage
+
 ## Conclusion
 
 This implementation guide provides a foundation for building the SmartVan anomaly detection system using the Laravel/Vue/Inertia stack. The design focuses on:
@@ -802,6 +1156,6 @@ This implementation guide provides a foundation for building the SmartVan anomal
 1. **Reliability**: Through queues, retry logic, and time-based resolution
 2. **Performance**: Using proper indexing, caching, and asynchronous processing 
 3. **Security**: Implementing proper authentication and data protection
-4. **Real-time capabilities**: With WebSockets and event broadcasting
+4. **Accuracy**: By handling real-world delivery patterns with one-to-many transaction matching
 
-The solution handles the specific challenges of the SmartVan system, particularly the need to correlate data from multiple sources and manage asynchronous data arrival while maintaining high accuracy in anomaly detection.
+The solution handles the specific challenges of the SmartVan system, particularly the need to correlate multiple inventory events with POS transactions while accounting for multi-trip delivery scenarios. This approach balances security needs with operational realities to minimize false positives.

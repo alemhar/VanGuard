@@ -48,13 +48,17 @@ IF event.event_type == "INVENTORY_CHANGE"
 THEN Flag as "POTENTIAL_THEFT"
 ```
 
-> **Note**: A strict one-to-one relationship must be maintained between inventory events and POS transactions:
+> **Note**: Inventory events and POS transactions have a one-to-many relationship reflecting real-world delivery scenarios:
 > 
-> 1. Each POS transaction should only be matched to a single inventory event. Once a transaction has been matched, it should be marked as 'used' and not available for validating other events.
+> 1. A single POS transaction often corresponds to multiple inventory events. For example, a transaction for 10 boxes will result in multiple inventory access events as staff makes several trips to unload all items.
 > 
-> 2. Similarly, each inventory event should only be matched to a single POS transaction. Once an event has been validated by a transaction, it should not be counted as validated by any other transactions.
+> 2. The system must track quantities and match the total number of items removed against the transaction quantity.
 > 
-> This bidirectional constraint prevents both scenarios: (a) using one transaction to justify multiple removals, and (b) using multiple transactions to obscure a single suspicious removal event.
+> 3. Each inventory event should still only be matched to a single POS transaction to prevent cross-transaction validation.
+> 
+> 4. A POS transaction should be considered "fully utilized" only when the total number of removal events matches the transaction quantity.
+> 
+> This approach accounts for standard delivery patterns while still preventing suspicious activity where items are removed without corresponding transactions.
 
 ### Rule 2: Unauthorized Access Detection
 
