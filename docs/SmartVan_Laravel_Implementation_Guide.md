@@ -1105,6 +1105,7 @@ class VanConfiguration extends Model
         'quantity_allowance_percentage',  // Default: 20%
         'stalled_transaction_hours',      // Default: 2 hours
         'default_items_per_trip',         // Default estimate of items per trip
+        'delivery_session_timeout_minutes', // Default: 30 minutes
         'settings'
     ];
     
@@ -1123,6 +1124,12 @@ class VanConfiguration extends Model
     {
         return $value ?? 2; // Default to 2 hours if not explicitly set
     }
+    
+    // Get the delivery session timeout (with default fallback)
+    public function getDeliverySessionTimeoutMinutesAttribute($value)
+    {
+        return $value ?? 30; // Default to 30 minutes if not explicitly set
+    }
 }
 ```
 
@@ -1135,6 +1142,7 @@ Schema::create('van_configurations', function (Blueprint $table) {
     $table->integer('quantity_allowance_percentage')->nullable();
     $table->integer('stalled_transaction_hours')->nullable();
     $table->integer('default_items_per_trip')->nullable();
+    $table->integer('delivery_session_timeout_minutes')->nullable();
     $table->json('settings')->nullable();
     $table->timestamps();
 });
@@ -1149,6 +1157,246 @@ The dashboard provides visualizations showing transaction utilization:
 3. **Timeline View**: Connecting multiple removal events to their parent transaction
 4. **Van Configuration Panel**: Interface to adjust per-van settings like quantity allowance percentage
 
+## Delivery Session Analysis
+
+The system includes a time-based approach for grouping inventory access events into "delivery sessions" based on idle time between events:
+
+```php
+class DeliverySessionService
+{
+    // Analyze events and group them into sessions
+    public function analyzeEventSessions($vanId, $startDate = null, $endDate = null)
+    {
+        // Get van-specific timeout setting
+        $vanConfig = VanConfiguration::where('van_id', $vanId)->first();
+        $sessionTimeout = $vanConfig?->delivery_session_timeout_minutes ?? 30; // Default 30 minutes
+        
+        // Get events in chronological order
+        $query = Event::where('van_id', $vanId)
+            ->where('event_type', 'INVENTORY_CHANGE')
+            ->orderBy('event_timestamp', 'asc');
+            
+        if ($startDate) {
+            $query->where('event_timestamp', '>=', Carbon::parse($startDate)->timestamp);
+        }
+        
+        if ($endDate) {
+            $query->where('event_timestamp', '<=', Carbon::parse($endDate)->timestamp);
+        }
+        
+        $events = $query->get();
+        
+        // Group events into sessions based on time proximity
+        $sessions = [];
+        $currentSession = null;
+        $lastEventTime = null;
+        
+        foreach ($events as $event) {
+            $eventTime = Carbon::createFromTimestamp($event->event_timestamp);
+            
+            // Check if this event should start a new session
+            $startNewSession = false;
+            
+            if ($lastEventTime === null) {
+                // First event always starts a new session
+                $startNewSession = true;
+            } else {
+                // Check time difference from last event
+                $minutesSinceLastEvent = $eventTime->diffInMinutes($lastEventTime);
+                
+                if ($minutesSinceLastEvent > $sessionTimeout) {
+                    // Gap exceeds timeout - start new session
+                    $startNewSession = true;
+                }
+            }
+            
+            if ($startNewSession) {
+                // Finalize previous session if exists
+                if ($currentSession !== null) {
+                    $this->finalizeSession($currentSession);
+                    $sessions[] = $currentSession;
+                }
+                
+                // Start new session
+                $currentSession = [
+                    'session_id' => 'session_' . $eventTime->format('Ymd_His'),
+                    'van_id' => $vanId,
+                    'start_time' => $eventTime,
+                    'end_time' => $eventTime,
+                    'events' => [],
+                    'total_items_detected' => 0,
+                    'matched_transaction' => null
+                ];
+            }
+            
+            // Add event to current session
+            $currentSession['events'][] = $event;
+            $currentSession['end_time'] = $eventTime; // Update session end time
+            
+            // Update item count
+            $inventoryData = json_decode($event->inventory, true);
+            $itemCount = isset($inventoryData['quantity_changed']) ? (int)$inventoryData['quantity_changed'] : 1;
+            $currentSession['total_items_detected'] += $itemCount;
+            
+            $lastEventTime = $eventTime;
+        }
+        
+        // Add final session if exists
+        if ($currentSession !== null) {
+            $this->finalizeSession($currentSession);
+            $sessions[] = $currentSession;
+        }
+        
+        return $sessions;
+    }
+    
+    // Try to match sessions with POS transactions
+    protected function finalizeSession(&$session)
+    {
+        // Calculate session duration in minutes
+        $session['duration_minutes'] = $session['start_time']->diffInMinutes($session['end_time']);
+        
+        // First check if events in this session already have transaction matches
+        $existingMatches = [];
+        $eventIds = collect($session['events'])->pluck('id')->toArray();
+        
+        // Find any existing event-transaction matches for events in this session
+        $eventMatches = EventTransactionMatch::whereIn('event_id', $eventIds)->with('transaction')->get();
+        
+        if ($eventMatches->isNotEmpty()) {
+            // Count matches by transaction to find the dominant transaction
+            $transactionCounts = $eventMatches->groupBy('transaction_id')
+                ->map(function ($matches) {
+                    return [
+                        'count' => $matches->count(),
+                        'transaction' => $matches->first()->transaction,
+                        'total_items' => $matches->sum('item_count')
+                    ];
+                })
+                ->sortByDesc('count');
+            
+            // Use the dominant transaction as the session match
+            $dominantMatch = $transactionCounts->first();
+            if ($dominantMatch) {
+                $session['matched_transaction'] = $dominantMatch['transaction'];
+                $session['match_confidence'] = 'HIGH'; // High confidence because it's based on existing matches
+                $session['match_source'] = 'EXISTING_EVENT_MATCHES';
+                $session['matched_events_count'] = $dominantMatch['count'];
+                $session['matched_items_count'] = $dominantMatch['total_items'];
+                return;
+            }
+        }
+        
+        // If no existing matches found, look for matching transactions within time window
+        $windowStart = $session['start_time']->copy()->subHours(1); // Look back 1 hour
+        $windowEnd = $session['end_time']->copy()->addHours(1);    // Look ahead 1 hour
+        
+        // Only consider transactions that aren't fully utilized
+        $potentialTransactions = PosTransaction::where('van_id', $session['van_id'])
+            ->whereBetween('transaction_timestamp', [$windowStart, $windowEnd])
+            ->whereRaw('(SELECT COALESCE(SUM(item_count), 0) FROM event_transaction_matches 
+                        WHERE transaction_id = pos_transactions.id) < pos_transactions.total_quantity')
+            ->orderBy(DB::raw('ABS(TIMESTAMPDIFF(SECOND, transaction_timestamp, "{$session['start_time']}"))'))
+            ->get();
+        
+        // Find best matching transaction by time and quantity
+        $bestMatch = null;
+        $bestMatchScore = 0;
+        
+        foreach ($potentialTransactions as $transaction) {
+            // Get remaining capacity
+            $remainingCapacity = $transaction->total_quantity - $transaction->matched_quantity;
+            
+            // Skip if not enough capacity for this session
+            if ($remainingCapacity < ($session['total_items_detected'] * 0.5)) {
+                continue;
+            }
+            
+            // Calculate time proximity score (higher is better)
+            $timeProximity = 1 - (min(
+                abs($transaction->transaction_timestamp->diffInMinutes($session['start_time'])),
+                abs($transaction->transaction_timestamp->diffInMinutes($session['end_time']))
+            ) / 60); // Normalize to 0-1 range (0 = 1 hour away, 1 = same time)
+            
+            // Calculate quantity match score
+            $quantityRatio = min(
+                $session['total_items_detected'] / max(1, $remainingCapacity),
+                $remainingCapacity / max(1, $session['total_items_detected'])
+            );
+            
+            // Combined score (50% time, 50% quantity)
+            $matchScore = ($timeProximity * 0.5) + ($quantityRatio * 0.5);
+            
+            if ($matchScore > $bestMatchScore) {
+                $bestMatch = $transaction;
+                $bestMatchScore = $matchScore;
+            }
+        }
+        
+        // Assign best match if score is good enough
+        if ($bestMatchScore > 0.6) {
+            $session['matched_transaction'] = $bestMatch;
+            $session['match_score'] = $bestMatchScore;
+            $session['match_confidence'] = $this->getMatchConfidenceLevel($bestMatchScore);
+            $session['match_source'] = 'TIME_AND_QUANTITY_ANALYSIS';
+            $session['available_capacity'] = $bestMatch->total_quantity - $bestMatch->matched_quantity;
+        }
+    }
+    
+    // Get confidence level from score
+    protected function getMatchConfidenceLevel($score)
+    {
+        if ($score > 0.8) return 'HIGH';
+        if ($score > 0.6) return 'MEDIUM';
+        return 'LOW';
+    }
+    
+    // Find orphaned sessions (no matched transaction)
+    public function findOrphanedSessions($vanId, $days = 7)
+    {
+        $sessions = $this->analyzeEventSessions(
+            $vanId, 
+            Carbon::now()->subDays($days)->startOfDay(), 
+            Carbon::now()
+        );
+        
+        return array_filter($sessions, function($session) {
+            return $session['matched_transaction'] === null;
+        });
+    }
+    
+    // Find potentially suspicious sessions
+    public function findSuspiciousSessions($vanId, $days = 7)
+    {
+        $sessions = $this->analyzeEventSessions(
+            $vanId, 
+            Carbon::now()->subDays($days)->startOfDay(), 
+            Carbon::now()
+        );
+        
+        return array_filter($sessions, function($session) {
+            // Sessions with unusual timing (very late hours)
+            $isLateHours = $session['start_time']->hour >= 22 || $session['start_time']->hour <= 5;
+            
+            // Sessions with unusually short duration but many items
+            $isRapidRemoval = $session['duration_minutes'] < 5 && $session['total_items_detected'] > 5;
+            
+            // Sessions with no human detection in any event
+            $hasHumanDetection = false;
+            foreach ($session['events'] as $event) {
+                $humanDetection = json_decode($event->human_detection, true);
+                if (isset($humanDetection['detected']) && $humanDetection['detected']) {
+                    $hasHumanDetection = true;
+                    break;
+                }
+            }
+            
+            return $isLateHours || $isRapidRemoval || !$hasHumanDetection;
+        });
+    }
+}
+```
+
 ## Conclusion
 
 This implementation guide provides a foundation for building the SmartVan anomaly detection system using the Laravel/Vue/Inertia stack. The design focuses on:
@@ -1159,3 +1407,158 @@ This implementation guide provides a foundation for building the SmartVan anomal
 4. **Accuracy**: By handling real-world delivery patterns with one-to-many transaction matching
 
 The solution handles the specific challenges of the SmartVan system, particularly the need to correlate multiple inventory events with POS transactions while accounting for multi-trip delivery scenarios. This approach balances security needs with operational realities to minimize false positives.
+
+## Practical Example: Transaction and Event Matching
+
+The following example illustrates how the system handles a day of operations for a single van (VAN-123) with multiple events and transactions. This example demonstrates the session grouping, transaction matching, and anomaly detection features working together.
+
+### Scenario
+
+- 1 van (VAN-123) with 10 inventory events throughout the day
+- 2 legitimate POS transactions for this van during the day
+- Various time gaps between events to demonstrate session grouping
+
+### Timeline
+
+**Morning Delivery (First Transaction)**
+```
+08:15 AM - POS Transaction #T001 created (5 items, total quantity)
+08:30 AM - Event #E001: Van door opened, human detected with YOLO
+08:32 AM - Event #E002: Inventory change (2 items removed)
+08:38 AM - Event #E003: Inventory change (3 items removed)
+08:42 AM - Event #E004: Van door closed
+```
+
+**Unexplained Mid-day Activity (No Transaction)**
+```
+12:05 PM - Event #E005: Van door opened, motion detected but no human detected
+12:07 PM - Event #E006: Inventory change (1 item removed)
+12:09 PM - Event #E007: Inventory change (1 item removed)
+12:11 PM - Event #E008: Van door closed
+```
+
+**Afternoon Delivery (Second Transaction)**
+```
+03:45 PM - POS Transaction #T002 created (4 items, total quantity)
+04:00 PM - Event #E009: Van door opened, human detected with YOLO
+04:05 PM - Event #E010: Inventory change (4 items removed)
+04:10 PM - Event #E011: Van door closed
+```
+
+### System Processing
+
+#### 1. Session Grouping
+
+The system groups events into sessions based on the 30-minute timeout:
+
+**Session 1 (Morning)**
+```
+Session ID: session_20250527_083000
+Events: #E001, #E002, #E003, #E004
+Total Items: 5
+Start Time: 08:30 AM
+End Time: 08:42 AM
+Duration: 12 minutes
+```
+
+**Session 2 (Mid-day)**
+```
+Session ID: session_20250527_120500
+Events: #E005, #E006, #E007, #E008
+Total Items: 2
+Start Time: 12:05 PM
+End Time: 12:11 PM
+Duration: 6 minutes
+```
+
+**Session 3 (Afternoon)**
+```
+Session ID: session_20250527_160000
+Events: #E009, #E010, #E011
+Total Items: 4
+Start Time: 04:00 PM
+End Time: 04:10 PM
+Duration: 10 minutes
+```
+
+#### 2. Transaction Matching
+
+The system matches individual events and sessions to transactions:
+
+**Transaction #T001 (5 items)**
+```
+Matched Events: #E002 (2 items), #E003 (3 items)
+Total Matched: 5 items (100% of transaction quantity)
+Status: COMPLETED
+Matched Session: Session 1
+Match Confidence: HIGH
+```
+
+**Transaction #T002 (4 items)**
+```
+Matched Events: #E010 (4 items)
+Total Matched: 4 items (100% of transaction quantity)
+Status: COMPLETED
+Matched Session: Session 3
+Match Confidence: HIGH
+```
+
+**Orphaned Events**
+```
+Events with no transaction match: #E006 (1 item), #E007 (1 item)
+Total Unmatched Items: 2
+Belongs to Session: Session 2
+```
+
+#### 3. Anomaly Detection
+
+The system identifies the following anomalies:
+
+**Session 2 Anomaly**
+```
+Anomaly Type: ORPHANED_SESSION
+Severity: MEDIUM
+Reason: Inventory removal with no matching transaction
+Score: 0.75
+Human Detection: NO (increases suspicion)
+Recommended Action: Review security footage from 12:05 PM - 12:11 PM
+```
+
+**Additional Analysis**
+```
+E006 & E007 Anomaly Details:
+- Items removed: 2 total
+- No human detected via YOLO in session
+- No matching POS transaction within 30 minutes before/after
+- No transaction with remaining capacity during this time window
+```
+
+### Dashboard Visualization
+
+The dashboard shows a timeline view of the day with color-coded sessions:
+- Session 1: Green (fully matched to transaction)
+- Session 2: Red (no matching transaction, potential anomaly)
+- Session 3: Green (fully matched to transaction)
+
+With drill-down capability to show individual events and their transaction matches.
+
+### Alert Generated
+
+```json
+{
+  "alert_id": "alert_20250527_1215",
+  "alert_type": "ORPHANED_SESSION",
+  "van_id": "VAN-123",
+  "timestamp": "2025-05-27T12:15:00",
+  "severity": "MEDIUM",
+  "details": {
+    "session_id": "session_20250527_120500",
+    "items_removed": 2,
+    "missing_human_detection": true,
+    "event_ids": ["E005", "E006", "E007", "E008"],
+    "recommended_action": "Review security footage"
+  }
+}
+```
+
+This example demonstrates how the system successfully groups related events into sessions, matches those sessions with appropriate transactions, identifies legitimate deliveries, and flags suspicious activity for further review. The 20% quantity allowance and 30-minute session timeout settings provide flexibility for real-world delivery patterns while still maintaining security.
